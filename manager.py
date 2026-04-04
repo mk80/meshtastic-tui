@@ -29,7 +29,7 @@ def start_daemon():
                 response = requests.get('http://localhost:5000/api/heatmap')
                 if response.status_code == 200:
                     print(f"\nDaemon successfully started (PID {proc.pid})!")
-                    print("You can now securely run listen.py, send.py, or view http://localhost:5000 simultaneously.")
+                    print("You can now securely run tui.py, send.py, or view http://localhost:5000 simultaneously.")
                     return
             except:
                 pass

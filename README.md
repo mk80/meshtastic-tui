@@ -64,10 +64,10 @@ You will see the dynamic dashboard loading. Leave this running in the background
 
 Because the daemon is running in the background, you can utilize the included helper scripts interchangeably across as many separate terminal windows as you wish!
 
-### Listening to Telemetry & Messages
-Watch the live feed of all text messages, node information, and position updates coming across your local device:
+### Monitoring & Chatting (TUI)
+For the best experience, use the Terminal Dashboard to watch the live feed and chat:
 ```bash
-python listen.py
+python tui.py
 ```
 
 ### Sending Messages
@@ -79,6 +79,30 @@ Or send a direct message to a specific Node ID (`!XXXXXXXX`):
 ```bash
 python send.py "Are you receiving this?" "!1234abcd"
 ```
+
+---
+
+## 📟 Terminal Dashboard (TUI)
+
+For a powerful, all-in-one console experience, use the built-in Terminal User Interface (TUI). This allows you to monitor your radio's health and chat with the mesh without ever leaving your terminal.
+
+```bash
+python tui.py
+```
+
+### **TUI Features:**
+- **Live Messaging**: Tabbed interface for all 8 channels + dynamic Direct Message (DM) tabs.
+- **Unread Indicators**: Alerts you when messages arrive on other channels.
+- **Hardware Stats**: Real-time battery voltage, channel utilization, and uptime.
+- **GPS Dashboard**: Detailed satellite lock count and precision (PDOP).
+- **Device Configuration**: Change your Long/Short names or send raw CLI configuration commands directly from the UI.
+
+### **Keyboard Shortcuts:**
+*   `ENTER`: Start typing a message / Send message.
+*   `ESC`: Cancel typing / Exit configuration mode.
+*   `TAB`: Cycle through Channels and active Direct Message tabs.
+*   `C`: Open the **Configuration Pane** (edit names or run CLI commands).
+*   `Q`: Quit the TUI.
 
 ---
 
