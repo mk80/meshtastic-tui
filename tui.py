@@ -166,17 +166,23 @@ class MeshTUI:
         
         # Populate GPS
         sats = self.state.get('sats', 0)
+        gps_live = self.state.get('gps_live', False)
         color = curses.color_pair(1) if sats >= 3 else curses.color_pair(3)
-        self.safe_addstr(split1 + 2, 2, f"Satellites: {sats}", color)
+        self.safe_addstr(split1 + 2, 2, f"Sats In View: {sats}", color)
         
         lat = self.state.get('latitude', 0.0)
         lon = self.state.get('longitude', 0.0)
-        status_text = "Acquiring..." if lat == 0.0 else f"Locked"
+        if lat == 0.0:
+            status_text = "Acquiring..."
+        elif not gps_live:
+            status_text = "Cached (awaiting live fix)"
+        else:
+            status_text = "Locked"
         self.safe_addstr(split1 + 3, 2, f"Lat: {lat:.5f}")
         self.safe_addstr(split1 + 4, 2, f"Lon: {lon:.5f}")
         
         pdop = self.state.get('pdop', 0) / 100.0
-        self.safe_addstr(split1 + 6, 2, f"Precision: {pdop}m")
+        self.safe_addstr(split1 + 6, 2, f"Precision: {pdop:.2f}m")
         self.safe_addstr(split1 + 7, 2, f"Status: {status_text}", color)
         
         # Populate Node Neighbors

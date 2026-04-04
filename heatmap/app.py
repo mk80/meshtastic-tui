@@ -74,6 +74,7 @@ def init_node_data(interface):
                     'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
                     'snr': snr,
                     'rssi': -100, # default weak rssi
+                    'source': 'init', # seeded from cached mesh DB — may be stale
                     'last_updated': time.time()
                 }
 
@@ -192,6 +193,7 @@ def on_receive(packet, interface):
                         'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
                         'snr': rxSnr,
                         'rssi': rxRssi,
+                        'source': 'live', # confirmed real-time from radio
                         'last_updated': time.time()
                     }
             elif display_from_id in nodes_data:
@@ -277,9 +279,10 @@ def api_state():
     long_name = user_info.get('longName', name)
     short_name = user_info.get('shortName', "Unknown")
 
-    # Live GPS fallback: nodes_data is updated in real-time by on_receive
-    # whereas getMyNodeInfo() position only updates on full node-info packet refresh.
-    live_pos = nodes_data.get(local_id, {}) if local_id else {}
+    # Only use nodes_data for GPS if it came from a live POSITION_APP packet.
+    # 'init' entries are seeded from the cached mesh DB and may be stale.
+    live_gps = nodes_data.get(local_id, {}) if local_id else {}
+    use_live_gps = live_gps.get('source') == 'live'
 
     state = {
         'nodes_online': len(nodes_data),
@@ -288,11 +291,11 @@ def api_state():
         'battery_voltage': metrics.get('voltage', 0.0),
         'battery_level': metrics.get('batteryLevel', 0),
         'chutil': metrics.get('channelUtilization', 0.0),
-        # Prefer the live nodes_data values if available, fall back to cached node_info
-        'sats': live_pos.get('sats') or pos.get('satsInView', 0),
-        'pdop': live_pos.get('pdop') or pos.get('PDOP', pos.get('HDOP', 0)),
-        'latitude': live_pos.get('latitude') or pos.get('latitude', 0.0),
-        'longitude': live_pos.get('longitude') or pos.get('longitude', 0.0),
+        'sats': live_gps.get('sats') if use_live_gps else pos.get('satsInView', 0),
+        'pdop': live_gps.get('pdop') if use_live_gps else pos.get('PDOP', pos.get('HDOP', 0)),
+        'latitude': live_gps.get('latitude') if use_live_gps else pos.get('latitude', 0.0),
+        'longitude': live_gps.get('longitude') if use_live_gps else pos.get('longitude', 0.0),
+        'gps_live': use_live_gps, # let TUI know if GPS data is fresh
         'name': name,
         'long_name': long_name,
         'short_name': short_name,

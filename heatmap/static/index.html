@@ -19,6 +19,26 @@
     </div>
     <div id="map"></div>
 
+    <!-- SNR Legend -->
+    <div id="snr-legend">
+        <div class="legend-title">Signal Strength (SNR)</div>
+        <div class="legend-gradient-wrap">
+            <div class="legend-gradient"></div>
+            <div class="legend-ticks">
+                <!-- Ticks correspond to gradient stops: 1.0→0.2 mapped to +10→−14 dB -->
+                <span>+10 dB</span>
+                <span>+4 dB</span>
+                <span>−2 dB</span>
+                <span>−8 dB</span>
+                <span>−14 dB</span>
+            </div>
+        </div>
+        <div class="legend-labels">
+            <span class="legend-label-weak">Weak</span>
+            <span class="legend-label-strong">Strong</span>
+        </div>
+    </div>
+
     <!-- Leaflet JS -->
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
     <!-- Leaflet Heat plugin -->
