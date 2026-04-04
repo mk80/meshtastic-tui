@@ -29,6 +29,15 @@ def proto_to_dict(obj):
         return [proto_to_dict(v) for v in obj]
     return obj
 
+def normalize_pos(pos):
+    """Normalize a position dict: convert latitudeI/longitudeI (int * 1e7) to float lat/lon."""
+    result = dict(pos)
+    if 'latitude' not in result and 'latitudeI' in result:
+        result['latitude'] = result['latitudeI'] / 1e7
+    if 'longitude' not in result and 'longitudeI' in result:
+        result['longitude'] = result['longitudeI'] / 1e7
+    return result
+
 def add_event(msg_or_dict):
     if isinstance(msg_or_dict, dict):
         clean_dict = proto_to_dict(msg_or_dict)
@@ -43,13 +52,15 @@ def init_node_data(interface):
         local_node = interface.getMyNodeInfo()
         if local_node and 'user' in local_node:
             local_id = local_node['user'].get('id')
+        if not local_id and hasattr(interface, 'myId'):
+            local_id = interface.myId
     except Exception:
         pass
 
     if interface.nodes:
         for node_id, info in interface.nodes.items():
             user = info.get('user', {})
-            pos = info.get('position', {})
+            pos = normalize_pos(info.get('position', {}))
             snr = info.get('snr', -10)
             
             if 'latitude' in pos and 'longitude' in pos:
@@ -68,7 +79,7 @@ def init_node_data(interface):
 
 def on_receive(packet, interface):
     try:
-        from_id = packet.get('fromId', 'Unknown')
+        from_id = packet.get('fromId')
         rxSnr = packet.get('rxSnr', -10)
         rxRssi = packet.get('rxRssi', -100)
         hopLimit = packet.get('hopLimit')
@@ -83,6 +94,10 @@ def on_receive(packet, interface):
                 local_id = l_info.get('user', {}).get('id')
         except:
             pass
+
+        # Packets from our own radio sometimes arrive with fromId=None
+        if not from_id:
+            from_id = local_id
 
         name = from_id
         if from_id == local_id:
@@ -141,7 +156,8 @@ def on_receive(packet, interface):
 
             # Update heatmap if position
             if portnum == 'POSITION_APP':
-                pos = decoded.get('position', {})
+                raw_pos = decoded.get('position', {})
+                pos = normalize_pos(raw_pos)
                 print(f"DEBUG_GPS: id={from_id}, is_local={from_id == local_id}, resolved_name={name}, pos={pos}", flush=True)
                 
                 add_event({
@@ -247,7 +263,11 @@ def api_state():
     user_info = node_info.get('user', {})
     long_name = user_info.get('longName', name)
     short_name = user_info.get('shortName', "Unknown")
-    
+
+    # Live GPS fallback: nodes_data is updated in real-time by on_receive
+    # whereas getMyNodeInfo() position only updates on full node-info packet refresh.
+    live_pos = nodes_data.get(local_id, {}) if local_id else {}
+
     state = {
         'nodes_online': len(nodes_data),
         'local_id': local_id or "Unknown",
@@ -255,10 +275,11 @@ def api_state():
         'battery_voltage': metrics.get('voltage', 0.0),
         'battery_level': metrics.get('batteryLevel', 0),
         'chutil': metrics.get('channelUtilization', 0.0),
-        'sats': pos.get('satsInView', 0),
-        'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
-        'latitude': pos.get('latitude', 0.0),
-        'longitude': pos.get('longitude', 0.0),
+        # Prefer the live nodes_data values if available, fall back to cached node_info
+        'sats': live_pos.get('sats') or pos.get('satsInView', 0),
+        'pdop': live_pos.get('pdop') or pos.get('PDOP', pos.get('HDOP', 0)),
+        'latitude': live_pos.get('latitude') or pos.get('latitude', 0.0),
+        'longitude': live_pos.get('longitude') or pos.get('longitude', 0.0),
         'name': name,
         'long_name': long_name,
         'short_name': short_name,
