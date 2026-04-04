@@ -95,25 +95,26 @@ def on_receive(packet, interface):
         except:
             pass
 
-        # Packets from our own radio sometimes arrive with fromId=None
-        if not from_id:
-            from_id = local_id
+        # NOTE: Do NOT substitute None fromId here globally - only POSITION_APP
+        # packets reliably come from the local radio with no fromId. Text/telemetry
+        # packets with missing fromId should safely fall back to 'Unknown'.
+        display_from_id = from_id or 'Unknown'
 
-        name = from_id
-        if from_id == local_id:
+        name = display_from_id
+        if display_from_id == local_id:
             # For the local node, use our specialized name resolver
             try:
                 my_user = interface.getMyUser()
                 if my_user:
                     u = proto_to_dict(my_user)
-                    name = u.get('longName', u.get('shortName', from_id))
+                    name = u.get('longName', u.get('shortName', display_from_id))
             except:
                 pass
         
         # Fallback to general nodes list if name is still ID
-        if name == from_id and hasattr(interface, 'nodes') and from_id in interface.nodes:
-            user_info = interface.nodes[from_id].get('user', {})
-            name = user_info.get('longName', user_info.get('shortName', from_id))
+        if name == display_from_id and hasattr(interface, 'nodes') and display_from_id in interface.nodes:
+            user_info = interface.nodes[display_from_id].get('user', {})
+            name = user_info.get('longName', user_info.get('shortName', display_from_id))
 
         if 'decoded' in packet:
             decoded = packet['decoded']
@@ -127,7 +128,7 @@ def on_receive(packet, interface):
                     'type': 'text',
                     'channel': packet.get('channel', 0),
                     'from': name,
-                    'fromId': from_id,
+                    'fromId': display_from_id,
                     'toId': packet.get('toId', 'Unknown'),
                     'text': text,
                     'hopLimit': hopLimit,
@@ -139,7 +140,7 @@ def on_receive(packet, interface):
                 add_event({
                     'type': 'telemetry',
                     'from': name,
-                    'fromId': from_id,
+                    'fromId': display_from_id,
                     'telemetry': telemetry,
                     'message': f"[TELEMETRY] From: {name} -> {telemetry}"
                 })
@@ -149,7 +150,7 @@ def on_receive(packet, interface):
                 add_event({
                     'type': 'nodeinfo',
                     'from': name,
-                    'fromId': from_id,
+                    'fromId': display_from_id,
                     'user': user,
                     'message': f"[NODE INFO] From: {name} -> {user.get('longName')} ({user.get('shortName')})"
                 })
@@ -158,20 +159,32 @@ def on_receive(packet, interface):
             if portnum == 'POSITION_APP':
                 raw_pos = decoded.get('position', {})
                 pos = normalize_pos(raw_pos)
-                print(f"DEBUG_GPS: id={from_id}, is_local={from_id == local_id}, resolved_name={name}, pos={pos}", flush=True)
+                # For position packets, None fromId reliably means it's our radio
+                position_from_id = from_id or local_id
+                position_is_local = (position_from_id == local_id)
+                # Resolve name for local node if substituted
+                if position_from_id and position_from_id != display_from_id and position_is_local:
+                    try:
+                        my_user = interface.getMyUser()
+                        if my_user:
+                            u = proto_to_dict(my_user)
+                            name = u.get('longName', u.get('shortName', position_from_id))
+                    except:
+                        name = position_from_id
+                print(f"DEBUG_GPS: id={position_from_id}, is_local={position_is_local}, resolved_name={name}, pos={pos}", flush=True)
                 
                 add_event({
                     'type': 'position',
                     'from': name,
-                    'fromId': from_id,
+                    'fromId': position_from_id,
                     'pos': pos,
                     'hopLimit': hopLimit,
                     'message': f"[POSITION] From: {name} -> Lat: {pos.get('latitude')}, Lon: {pos.get('longitude')}"
                 })
                 if 'latitude' in pos and 'longitude' in pos:
-                    nodes_data[from_id] = {
-                        'id': from_id,
-                        'is_local': (from_id == local_id),
+                    nodes_data[position_from_id] = {
+                        'id': position_from_id,
+                        'is_local': position_is_local,
                         'name': name,
                         'latitude': pos['latitude'],
                         'longitude': pos['longitude'],
@@ -181,10 +194,10 @@ def on_receive(packet, interface):
                         'rssi': rxRssi,
                         'last_updated': time.time()
                     }
-            elif from_id in nodes_data:
-                nodes_data[from_id]['snr'] = rxSnr
-                nodes_data[from_id]['rssi'] = rxRssi
-                nodes_data[from_id]['last_updated'] = time.time()
+            elif display_from_id in nodes_data:
+                nodes_data[display_from_id]['snr'] = rxSnr
+                nodes_data[display_from_id]['rssi'] = rxRssi
+                nodes_data[display_from_id]['last_updated'] = time.time()
                 
     except Exception as e:
         print(f"Error handling packet: {e}")
