@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meshtastic RF Heatmap</title>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <div id="ui-overlay">
+        <h1>RF Coverage Heatmap</h1>
+        <div class="stats">
+            <p>Nodes Mapped: <span id="node-count">0</span></p>
+            <p>GPS Status: <span id="gps-status" style="color: #ffaa00;">Searching...</span></p>
+            <p class="subtitle">Live from your Meshtastic Radio</p>
+        </div>
+    </div>
+    <div id="map"></div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <!-- Leaflet Heat plugin -->
+    <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+    <!-- App Logic -->
+    <script src="/static/app.js"></script>
+</body>
+</html>
