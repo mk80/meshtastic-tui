@@ -160,42 +160,39 @@ def on_receive(packet, interface):
             if portnum == 'POSITION_APP':
                 raw_pos = decoded.get('position', {})
                 pos = normalize_pos(raw_pos)
-                # For position packets, None fromId reliably means it's our radio
-                position_from_id = from_id or local_id
-                position_is_local = (position_from_id == local_id)
-                # Resolve name for local node if substituted
-                if position_from_id and position_from_id != display_from_id and position_is_local:
-                    try:
-                        my_user = interface.getMyUser()
-                        if my_user:
-                            u = proto_to_dict(my_user)
-                            name = u.get('longName', u.get('shortName', position_from_id))
-                    except:
-                        name = position_from_id
-                print(f"DEBUG_GPS: id={position_from_id}, is_local={position_is_local}, resolved_name={name}, pos={pos}", flush=True)
-                
-                add_event({
-                    'type': 'position',
-                    'from': name,
-                    'fromId': position_from_id,
-                    'pos': pos,
-                    'hopLimit': hopLimit,
-                    'message': f"[POSITION] From: {name} -> Lat: {pos.get('latitude')}, Lon: {pos.get('longitude')}"
-                })
-                if 'latitude' in pos and 'longitude' in pos:
-                    nodes_data[position_from_id] = {
-                        'id': position_from_id,
-                        'is_local': position_is_local,
-                        'name': name,
-                        'latitude': pos['latitude'],
-                        'longitude': pos['longitude'],
-                        'sats': pos.get('satsInView', 0),
-                        'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
-                        'snr': rxSnr,
-                        'rssi': rxRssi,
-                        'source': 'live', # confirmed real-time from radio
-                        'last_updated': time.time()
-                    }
+
+                # Drop packets with no sender ID entirely.
+                # A None fromId can come from ANY relayed/corrupted mesh packet —
+                # not just our own radio. Our local GPS is now handled solely by
+                # local_gps_poller reading interface.nodes[myId] directly.
+                if not from_id:
+                    print(f"DEBUG_GPS: dropping no-sender position packet (pos={pos})", flush=True)
+                else:
+                    position_is_local = (from_id == local_id)
+                    print(f"DEBUG_GPS: id={from_id}, is_local={position_is_local}, name={name}, pos={pos}", flush=True)
+
+                    add_event({
+                        'type': 'position',
+                        'from': name,
+                        'fromId': from_id,
+                        'pos': pos,
+                        'hopLimit': hopLimit,
+                        'message': f"[POSITION] From: {name} -> Lat: {pos.get('latitude')}, Lon: {pos.get('longitude')}"
+                    })
+                    if 'latitude' in pos and 'longitude' in pos:
+                        nodes_data[from_id] = {
+                            'id': from_id,
+                            'is_local': position_is_local,
+                            'name': name,
+                            'latitude': pos['latitude'],
+                            'longitude': pos['longitude'],
+                            'sats': pos.get('satsInView', 0),
+                            'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
+                            'snr': rxSnr,
+                            'rssi': rxRssi,
+                            'source': 'live',
+                            'last_updated': time.time()
+                        }
             elif display_from_id in nodes_data:
                 nodes_data[display_from_id]['snr'] = rxSnr
                 nodes_data[display_from_id]['rssi'] = rxRssi
@@ -204,6 +201,50 @@ def on_receive(packet, interface):
     except Exception as e:
         print(f"Error handling packet: {e}")
 
+def local_gps_poller():
+    """
+    Poll the Meshtastic library's internal node state every 15 seconds for the
+    local node's GPS. The library keeps interface.nodes[myId] updated via its
+    serial thread, independent of the mesh broadcast timer (position_broadcast_secs).
+    This means we get updated GPS within ~15s of a fix, not up to 15 minutes.
+    """
+    while True:
+        time.sleep(15)
+        if not interface:
+            continue
+        try:
+            local_id = getattr(interface, 'myId', None)
+            if not local_id:
+                continue
+            if not hasattr(interface, 'nodes') or local_id not in interface.nodes:
+                continue
+
+            pos = normalize_pos(interface.nodes[local_id].get('position', {}))
+            lat = pos.get('latitude')
+            lon = pos.get('longitude')
+
+            if not lat or not lon:
+                continue
+
+            existing = nodes_data.get(local_id, {})
+            # Promote to 'live' if: we only had stale init data, or coords changed
+            if (existing.get('source') == 'init'
+                    or lat != existing.get('latitude')
+                    or lon != existing.get('longitude')):
+                nodes_data[local_id] = {
+                    **existing,   # preserve is_local, name, snr, rssi
+                    'latitude': lat,
+                    'longitude': lon,
+                    'sats': pos.get('satsInView', existing.get('sats', 0)),
+                    'pdop': pos.get('PDOP', pos.get('HDOP', existing.get('pdop', 0))),
+                    'source': 'live',
+                    'last_updated': time.time(),
+                }
+                print(f"GPS_POLL: local GPS updated from library state → "
+                      f"{lat:.5f}, {lon:.5f}  sats={pos.get('satsInView', '?')}", flush=True)
+        except Exception as e:
+            print(f"GPS poll error: {e}", flush=True)
+
 def connect_radio():
     global interface
     print("Connecting to Meshtastic...")
@@ -211,9 +252,13 @@ def connect_radio():
         interface = meshtastic.serial_interface.SerialInterface()
         init_node_data(interface)
         pub.subscribe(on_receive, "meshtastic.receive")
+        # Start background GPS poller for the local node
+        t = threading.Thread(target=local_gps_poller, daemon=True)
+        t.start()
         print(f"Connected! Seeded map with {len(nodes_data)} nodes.")
     except Exception as e:
         print(f"Failed to connect to radio: {e}")
+
 
 @app.route('/')
 def index():
