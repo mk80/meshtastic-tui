@@ -309,18 +309,22 @@ class MeshTUI:
                                 if not isinstance(self.active_channel, int):
                                     payload["destination"] = self.active_channel
                                     
-                                requests.post(f"{API_URL}/api/send", json=payload)
-                                
-                                # local echo
-                                self.messages.append({
-                                    'time': time.time(), 
-                                    'channel': self.active_channel if isinstance(self.active_channel, int) else 0, 
-                                    'from': 'You', 
-                                    'fromId': self.state.get('local_id'),
-                                    'toId': '^all' if isinstance(self.active_channel, int) else self.active_channel,
-                                    'text': self.input_text.strip(),
-                                    'hopLimit': 3 # Default local hop limit
-                                })
+                                try:
+                                    requests.post(f"{API_URL}/api/send", json=payload, timeout=2)
+                                    
+                                    # local echo
+                                    self.messages.append({
+                                        'time': time.time(), 
+                                        'channel': self.active_channel if isinstance(self.active_channel, int) else 0, 
+                                        'from': 'You', 
+                                        'fromId': self.state.get('local_id'),
+                                        'toId': '^all' if isinstance(self.active_channel, int) else self.active_channel,
+                                        'text': self.input_text.strip(),
+                                        'hopLimit': 3 # Default local hop limit
+                                    })
+                                except:
+                                    pass # suppress crash, UI will just not show the echo if it fails
+                                    
                                 self.input_text = ""
                             self.input_mode = False
                         elif c == 27: # ESC

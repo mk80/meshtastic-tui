@@ -16,14 +16,17 @@ CORS(app)
 # Global dictionaries
 nodes_data = {}
 events = deque(maxlen=200)
+events_lock = threading.Lock()
 MESSAGES_FILE = 'messages.json'
 
 def save_events():
     try:
         # Use a temporary file and rename to ensure atomic write
         tmp_file = MESSAGES_FILE + ".tmp"
+        with events_lock:
+            data = list(events)
         with open(tmp_file, 'w') as f:
-            json.dump(list(events), f)
+            json.dump(data, f)
         os.replace(tmp_file, MESSAGES_FILE)
     except Exception as e:
         print(f"Error saving messages: {e}")
@@ -33,7 +36,9 @@ def load_events():
         try:
             with open(MESSAGES_FILE, 'r') as f:
                 saved = json.load(f)
-                events.extend(saved)
+                with events_lock:
+                    events.clear()
+                    events.extend(saved)
                 print(f"Loaded {len(saved)} messages from history.")
         except Exception as e:
             print(f"Error loading messages: {e}")
@@ -65,9 +70,11 @@ def add_event(msg_or_dict):
     if isinstance(msg_or_dict, dict):
         clean_dict = proto_to_dict(msg_or_dict)
         clean_dict['time'] = time.time()
-        events.append(clean_dict)
+        with events_lock:
+            events.append(clean_dict)
     else:
-        events.append({'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'})
+        with events_lock:
+            events.append({'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'})
     save_events()
 
 def init_node_data(interface):
@@ -295,7 +302,8 @@ def api_heatmap():
 @app.route('/api/stream')
 def api_stream():
     since = request.args.get('since', 0, type=float)
-    new_events = [e for e in events if e['time'] > since]
+    with events_lock:
+        new_events = [e for e in events if e.get('time', 0.0) > since]
     return jsonify(new_events)
 
 @app.route('/api/state')
@@ -495,7 +503,8 @@ def api_send():
         try:
             my_user = interface.getMyUser()
             if my_user:
-                name = my_user.get('longName', my_user.get('shortName', 'Local'))
+                # User objects are protobufs, they don't have .get()
+                name = getattr(my_user, 'longName', getattr(my_user, 'shortName', 'Local'))
         except:
             pass
 
