@@ -2,6 +2,7 @@ import curses
 import time
 import requests
 import threading
+import textwrap
 
 API_URL = "http://localhost:5000"
 BROADCAST_ADDRS = ('^all', '^local', '!ffffffff')
@@ -28,10 +29,14 @@ class MeshTUI:
         self.input_text = ""
         self.config_mode = False
         self.config_idx = 0
-        self.config_buffers = ["", "", ""]
+        self.config_buffers = ["", "", "", ""] # 4 fields now
         self.config_status = ""
         self.config_status_time = 0
+        self.config_saving = False
         self.unread_tabs = set()
+        self.node_list = []
+        self.node_mode = False
+        self.node_idx = 0
         self.last_event_time = 0.0
         self.last_server_time = 0.0
         self.offline_mode = False
@@ -82,10 +87,22 @@ class MeshTUI:
                                 if target and target not in self.dm_nodes:
                                     self.dm_nodes[target] = e.get('from', target) if from_id != local_id else target
                             
+                            # Handle local messages: label history as 'You', skip live echoes
+                            if from_id == local_id:
+                                if self.last_event_time == 0.0: # This is a history fetch
+                                    e['from'] = 'You'
+                                else:
+                                    continue # Skip brand new local echoes from the radio
+                            
                             # Deduplicate by time if needed, but for now just append
                             self.messages.append(e)
                         elif e.get('type') == 'position':
                             self.neighbor_events.append(e)
+                    
+                    # Fetch nodes
+                    r_nodes = requests.get(f"{API_URL}/api/nodes", timeout=2)
+                    if r_nodes.status_code == 200:
+                        self.node_list = r_nodes.json()
                 else:
                     self.offline_mode = True
             except Exception:
@@ -138,14 +155,34 @@ class MeshTUI:
             tel_y += 1
             
         # Device Config
+        status_line = ""
+        status_color = 0
+        if self.config_saving:
+            status_line = "[ SENDING... ]"
+            status_color = curses.color_pair(3) | curses.A_BOLD
+        elif self.config_status and time.time() - self.config_status_time < 3:
+            status_line = f"[ {self.config_status} ]"
+            status_color = curses.color_pair(2) | curses.A_BOLD
+
         self.safe_addstr(split3, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
+        if status_line:
+            self.safe_addstr(split3, mid_x - len(status_line) - 2, status_line, status_color)
+            
         conf_y = split3 + 1
-        fields = ["Long Name", "Short Name", "CLI Command"]
+        fields = ["Long Name", "Short Name", "Hop Limit", "CLI Command"]
         for i, field in enumerate(fields):
             color = curses.color_pair(1) if (self.config_mode and self.config_idx == i) else 0
             label = f"{field}: "
             self.safe_addstr(conf_y + i, 2, label)
-            val = self.config_buffers[i] if self.config_mode else (self.state.get('long_name') if i == 0 else (self.state.get('short_name') if i == 1 else ""))
+            
+            if self.config_mode:
+                val = self.config_buffers[i]
+            else:
+                if i == 0: val = self.state.get('long_name')
+                elif i == 1: val = self.state.get('short_name')
+                elif i == 2: val = self.state.get('hop_limit', 3)
+                else: val = ""
+                
             self.safe_addstr(conf_y + i, 2 + len(label), str(val or "")[:mid_x-len(label)-3], color)
 
     def draw_messages(self, h, w, mid_x):
@@ -157,36 +194,81 @@ class MeshTUI:
             unread_str = f" [Unread: {len(self.unread_tabs)}] "
             self.safe_addstr(0, w - len(unread_str) - 2, unread_str, curses.color_pair(4) | curses.A_BOLD)
 
+        if self.node_mode:
+            self.draw_node_selection(h, w, mid_x)
+            return
+
         local_id = self.state.get('local_id')
         if isinstance(self.active_channel, int):
             filtered = [m for m in self.messages if m.get('channel') == self.active_channel and m.get('toId') in BROADCAST_ADDRS]
         else:
             filtered = [m for m in self.messages if (m.get('fromId') == self.active_channel and m.get('toId') == local_id) or (m.get('fromId') == local_id and m.get('toId') == self.active_channel)]
 
-        msg_y = 2
-        max_msgs = h - 6
-        for m in filtered[-max_msgs:]:
+        msg_y = h - 6 # Start from bottom and work up
+        max_y = 2
+        
+        # Reverse the list so we can draw from bottom up more easily, or just limit total lines
+        for m in reversed(filtered):
+            if msg_y <= max_y: break
+            
             sender = m.get('from', 'Unknown')
             name_color = curses.color_pair(1)|curses.A_BOLD if sender == 'You' else (curses.color_pair(3)|curses.A_BOLD if not isinstance(self.active_channel, int) else curses.color_pair(2)|curses.A_BOLD)
             hop = m.get('hopLimit')
             display_name = f"{sender}{f'({hop})' if hop is not None else ''}: "
             text = m.get('text', '')
-            available_w = w - mid_x - len(display_name) - 4
-            self.safe_addstr(msg_y, mid_x + 2, display_name, name_color)
-            self.safe_addstr(msg_y, mid_x + 2 + len(display_name), text[:available_w])
-            msg_y += 1
+            
+            available_w = w - mid_x - len(display_name) - 5
+            wrapped = textwrap.wrap(text, available_w) or [""]
+            
+            # Draw lines from bottom of current message up
+            for i, line in enumerate(reversed(wrapped)):
+                if msg_y <= max_y: break
+                if i == len(wrapped) - 1: # First line of message (has name)
+                    self.safe_addstr(msg_y, mid_x + 2, display_name, name_color)
+                    self.safe_addstr(msg_y, mid_x + 2 + len(display_name), line)
+                else: # Continuation lines
+                    self.safe_addstr(msg_y, mid_x + 2 + len(display_name), line)
+                msg_y -= 1
+
+    def draw_node_selection(self, h, w, mid_x):
+        self.safe_addstr(2, mid_x + 2, "Discovery: SELECT NODE TO DM", curses.color_pair(3) | curses.A_BOLD)
+        self.safe_addstr(3, mid_x + 2, f"{'ID':<10} {'NAME':<15} {'SNR':<5} {'LAST HEARD':<10}")
+        self.safe_addstr(4, mid_x + 2, "-" * (w - mid_x - 5))
+        
+        start_y = 5
+        max_rows = h - 10
+        for i, node in enumerate(self.node_list[:max_rows]):
+            attr = curses.A_REVERSE if i == self.node_idx else 0
+            node_id = node.get('id', 'Unknown')
+            name = node.get('long_name', node_id)
+            snr = node.get('snr', 0)
+            lh = node.get('last_heard', 0)
+            lh_str = f"{int(time.time() - lh)}s ago" if lh > 0 else "Never"
+            
+            line = f"{node_id:<10} {name[:15]:<15} {snr:<5} {lh_str:<10}"
+            self.safe_addstr(start_y + i, mid_x + 2, line[:w-mid_x-5], attr)
 
     def draw_input(self, h, mid_x, w):
         self.stdscr.hline(h-4, mid_x + 1, curses.ACS_HLINE, w - mid_x - 2)
         if self.input_mode:
             prompt = "Type message: "
-            self.safe_addstr(h-3, mid_x + 2, prompt + self.input_text)
+            available_w = w - mid_x - len(prompt) - 4
+            # Scroll input if too long
+            display_text = self.input_text
+            if len(display_text) > available_w:
+                display_text = "..." + display_text[-(available_w-3):]
+            
+            self.safe_addstr(h-3, mid_x + 2, prompt + display_text)
             curses.curs_set(1)
-            try: self.stdscr.move(h-3, mid_x + 2 + len(prompt) + len(self.input_text))
+            try: self.stdscr.move(h-3, mid_x + 2 + len(prompt) + len(display_text))
             except: pass
+        elif self.node_mode:
+            self.safe_addstr(h-3, mid_x + 2, "[UP/DOWN arrows] [ENTER to DM] [L to cancel]", curses.color_pair(3))
         else:
             curses.curs_set(0)
-            self.safe_addstr(h-3, mid_x + 2, "[ENTER to message] [TAB channel/DM] [C config] [Q quit]", curses.color_pair(3))
+            available_w = w - mid_x - 4
+            help_text = "[ENTER to msg] [TAB ch/DM] [C config] [L find nodes]"
+            self.safe_addstr(h-3, mid_x + 2, help_text[:available_w], curses.color_pair(3))
 
     def draw(self):
         self.stdscr.erase()
@@ -214,6 +296,25 @@ class MeshTUI:
         self.draw_messages(h, w, mid_x)
         self.draw_input(h, mid_x, w)
         self.stdscr.refresh()
+
+    def save_config_async(self, payload, idx):
+        self.config_saving = True
+        try:
+            # Optimistic Update for immediate feedback
+            if idx == 0: self.state['long_name'] = payload['long_name']
+            elif idx == 1: self.state['short_name'] = payload['short_name']
+            elif idx == 2: self.state['hop_limit'] = payload['hop_limit']
+            
+            resp = requests.post(f"{API_URL}/api/config/apply", json=payload, timeout=10)
+            if resp.status_code == 200:
+                self.config_status = "Saved!"
+            else:
+                self.config_status = f"Err: {resp.status_code}"
+        except Exception as e:
+            self.config_status = f"Error: {str(e)[:10]}"
+        
+        self.config_saving = False
+        self.config_status_time = time.time()
 
     def run(self):
         self.stdscr.nodelay(True)
@@ -247,7 +348,7 @@ class MeshTUI:
                                         'fromId': self.state.get('local_id'),
                                         'toId': '^all' if isinstance(self.active_channel, int) else self.active_channel,
                                         'text': self.input_text.strip(),
-                                        'hopLimit': 3 # Default local hop limit
+                                        'hopLimit': self.state.get('hop_limit', 3) 
                                     })
                                 except:
                                     pass # suppress crash, UI will just not show the echo if it fails
@@ -265,32 +366,57 @@ class MeshTUI:
                         if c == 27: # ESC
                             self.config_mode = False
                         elif c == 9: # TAB
-                            self.config_idx = (self.config_idx + 1) % 3
+                            self.config_idx = (self.config_idx + 1) % 4
                         elif c in (10, 13): # ENTER
                             payload = {}
-                            if self.config_idx == 0: payload['long_name'] = self.config_buffers[0]
-                            elif self.config_idx == 1: payload['short_name'] = self.config_buffers[1]
-                            elif self.config_idx == 2: payload['command'] = self.config_buffers[2]
+                            field_val = self.config_buffers[self.config_idx].strip()
+                            if self.config_idx == 0: payload['long_name'] = field_val
+                            elif self.config_idx == 1: payload['short_name'] = field_val
+                            elif self.config_idx == 2: 
+                                try: payload['hop_limit'] = int(field_val or 3)
+                                except: payload['hop_limit'] = 3
+                            elif self.config_idx == 3: payload['command'] = field_val
                             
-                            try:
-                                requests.post(f"{API_URL}/api/config/apply", json=payload)
-                                self.config_status = "Saved!"
-                            except:
-                                self.config_status = "Error!"
-                            self.config_status_time = time.time()
-                            if self.config_idx == 2: self.config_buffers[2] = ""
-                            else: self.config_mode = False
+                            # Start non-blocking save
+                            threading.Thread(target=self.save_config_async, args=(payload, self.config_idx), daemon=True).start()
+                            
+                            if self.config_idx == 3: 
+                                self.config_buffers[3] = "" 
+                            else: 
+                                self.config_mode = False
                         elif c in (curses.KEY_BACKSPACE, 127, 8):
                             self.config_buffers[self.config_idx] = self.config_buffers[self.config_idx][:-1]
                         elif 32 <= c <= 126:
                             self.config_buffers[self.config_idx] += chr(c)
+                    elif self.node_mode:
+                        if c == ord('l') or c == ord('L') or c == 27: # ESC
+                            self.node_mode = False
+                        elif c == curses.KEY_UP:
+                            self.node_idx = max(0, self.node_idx - 1)
+                        elif c == curses.KEY_DOWN:
+                            self.node_idx = min(len(self.node_list) - 1, self.node_idx + 1)
+                        elif c in (10, 13): # ENTER
+                            if self.node_list:
+                                target = self.node_list[self.node_idx]
+                                node_id = target.get('id')
+                                self.dm_nodes[node_id] = target.get('long_name', node_id)
+                                self.active_channel = node_id
+                                self.node_mode = False
                     else:
                         if c == ord('q') or c == ord('Q'):
                             self.running = False
                         elif c == ord('c') or c == ord('C'):
                             self.config_mode = True
                             self.config_idx = 0
-                            self.config_buffers = [self.state.get('long_name', ''), self.state.get('short_name', ''), '']
+                            self.config_buffers = [
+                                self.state.get('long_name', ''), 
+                                self.state.get('short_name', ''), 
+                                str(self.state.get('hop_limit', 3)), 
+                                ''
+                            ]
+                        elif c == ord('l') or c == ord('L'):
+                            self.node_mode = True
+                            self.node_idx = 0
                         elif c == 9: # TAB
                             # Cycle channels (0-7 standard) + DM nodes
                             dm_list = list(self.dm_nodes.keys())
