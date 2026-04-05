@@ -273,6 +273,25 @@ def local_gps_poller():
         except Exception as e:
             logger.error(f"GPS poller error: {e}")
 
+def connection_monitor():
+    global interface
+    while True:
+        time.sleep(2) # Faster detection for snappier UI recovery
+        is_alive = False
+        try:
+            if interface and interface.nodes:
+                is_alive = True
+        except:
+            is_alive = False
+
+        if not is_alive:
+            logger.warning("Radio connection lost. Attempting to reconnect...")
+            if interface:
+                try: interface.close()
+                except: pass
+                interface = None
+            connect_radio()
+
 def connect_radio():
     global interface
     logger.info("Connecting to Meshtastic...")
@@ -280,7 +299,14 @@ def connect_radio():
         interface = meshtastic.serial_interface.SerialInterface()
         init_node_data(interface)
         pub.subscribe(on_receive, "meshtastic.receive")
-        threading.Thread(target=local_gps_poller, daemon=True).start()
+        
+        # Start background threads if not already running
+        # We use a simple flag check to avoid duplicate threads on reconnect
+        if not any(t.name == "gps_poller" for t in threading.enumerate()):
+            threading.Thread(target=local_gps_poller, daemon=True, name="gps_poller").start()
+        if not any(t.name == "conn_monitor" for t in threading.enumerate()):
+            threading.Thread(target=connection_monitor, daemon=True, name="conn_monitor").start()
+            
         logger.info(f"Connected! Initialized with {len(nodes_data)} nodes.")
     except Exception as e:
         logger.error(f"Connection failed: {e}")
@@ -327,6 +353,13 @@ def api_state():
         live_gps = nodes_data.get(local_id, {})
     use_live_gps = live_gps.get('source') == 'live'
 
+    # Get Lora Config
+    lora_config = {}
+    try:
+        lora_config = interface.localNode.localConfig.lora
+    except:
+        pass
+
     state = {
         'nodes_online': len(nodes_data),
         'local_id': local_id,
@@ -342,7 +375,8 @@ def api_state():
         'name': name,
         'long_name': user_info.get('longName', name),
         'short_name': user_info.get('shortName', "Unknown"),
-        'server_time': time.time() # Added for TUI resync detection
+        'hop_limit': getattr(lora_config, 'hopLimit', 3), # Expose hop limit
+        'server_time': time.time()
     }
     return jsonify(state)
 
@@ -358,6 +392,9 @@ def api_config_apply():
                 long_name=data.get('long_name'),
                 short_name=data.get('short_name')
             )
+            
+        if 'hop_limit' in data:
+            set_pref(interface.localNode, 'lora.hop_limit', data['hop_limit'])
         
         if 'command' in data:
             cmd = data['command'].strip()
@@ -376,6 +413,16 @@ def api_config_apply():
 def set_pref(node, key, val):
     import meshtastic.util
     
+    # Preferred way: use library helper if available
+    try:
+        if hasattr(node, 'set_simple_preference'):
+            logger.info(f"Using set_simple_preference for {key} = {val}")
+            node.set_simple_preference(key, val)
+            return True
+    except Exception as e:
+        logger.warning(f"set_simple_preference failed for {key}: {e}")
+
+    # Fallback: Manual protobuf manipulation
     section_map = {
         'device': node.localConfig.device,
         'lora': node.localConfig.lora,
@@ -406,6 +453,22 @@ def set_pref(node, key, val):
         raise ValueError(f"Unknown section: {section_name}")
     
     section = section_map[section_name]
+    
+    # CLI sync logic: Request config if we don't have its fields yet
+    try:
+        if len(section.ListFields()) == 0:
+            logger.info(f"Section {section_name} is empty, requesting from radio...")
+            field_desc = node.localConfig.DESCRIPTOR.fields_by_name.get(section_name)
+            if not field_desc:
+                field_desc = node.moduleConfig.DESCRIPTOR.fields_by_name.get(section_name)
+            
+            if field_desc:
+                node.requestConfig(field_desc)
+                # Short wait for response
+                time.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"Failed to requestConfig for {section_name}: {e}")
+
     field_name_snake = meshtastic.util.camel_to_snake(field_name)
     
     # Try both snake and camel case for the attribute
@@ -424,6 +487,8 @@ def set_pref(node, key, val):
     if not field_desc:
         raise ValueError(f"Protobuf metadata not found for {target_field}")
 
+    logger.info(f"Manual fallback config: {section_name}.{target_field} = {val} (type={field_desc.type})")
+
     # Convert value based on protobuf type
     if field_desc.type in [field_desc.TYPE_INT32, field_desc.TYPE_UINT32, field_desc.TYPE_INT64, field_desc.TYPE_UINT64]:
         val = int(val)
@@ -441,12 +506,8 @@ def set_pref(node, key, val):
 
     setattr(section, target_field, val)
     
-    # Persist change - node.iface.localNode points back to same object usually
-    if section_name in ['device', 'lora', 'network', 'display', 'position', 'power', 'security']:
-        node.iface.localNode.writeConfig(section_name)
-    else:
-        node.iface.localNode.writeConfig("moduleConfig")
-
+    # Persist change
+    node.iface.localNode.writeConfig(section_name)
     return True
 
 @app.route('/api/send', methods=['POST'])

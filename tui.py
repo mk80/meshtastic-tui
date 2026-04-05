@@ -28,9 +28,10 @@ class MeshTUI:
         self.input_text = ""
         self.config_mode = False
         self.config_idx = 0
-        self.config_buffers = ["", "", ""]
+        self.config_buffers = ["", "", "", ""] # 4 fields now
         self.config_status = ""
         self.config_status_time = 0
+        self.config_saving = False
         self.unread_tabs = set()
         self.last_event_time = 0.0
         self.last_server_time = 0.0
@@ -138,14 +139,34 @@ class MeshTUI:
             tel_y += 1
             
         # Device Config
+        status_line = ""
+        status_color = 0
+        if self.config_saving:
+            status_line = "[ SENDING... ]"
+            status_color = curses.color_pair(3) | curses.A_BOLD
+        elif self.config_status and time.time() - self.config_status_time < 3:
+            status_line = f"[ {self.config_status} ]"
+            status_color = curses.color_pair(2) | curses.A_BOLD
+
         self.safe_addstr(split3, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
+        if status_line:
+            self.safe_addstr(split3, mid_x - len(status_line) - 2, status_line, status_color)
+            
         conf_y = split3 + 1
-        fields = ["Long Name", "Short Name", "CLI Command"]
+        fields = ["Long Name", "Short Name", "Hop Limit", "CLI Command"]
         for i, field in enumerate(fields):
             color = curses.color_pair(1) if (self.config_mode and self.config_idx == i) else 0
             label = f"{field}: "
             self.safe_addstr(conf_y + i, 2, label)
-            val = self.config_buffers[i] if self.config_mode else (self.state.get('long_name') if i == 0 else (self.state.get('short_name') if i == 1 else ""))
+            
+            if self.config_mode:
+                val = self.config_buffers[i]
+            else:
+                if i == 0: val = self.state.get('long_name')
+                elif i == 1: val = self.state.get('short_name')
+                elif i == 2: val = self.state.get('hop_limit', 3)
+                else: val = ""
+                
             self.safe_addstr(conf_y + i, 2 + len(label), str(val or "")[:mid_x-len(label)-3], color)
 
     def draw_messages(self, h, w, mid_x):
@@ -215,6 +236,25 @@ class MeshTUI:
         self.draw_input(h, mid_x, w)
         self.stdscr.refresh()
 
+    def save_config_async(self, payload, idx):
+        self.config_saving = True
+        try:
+            # Optimistic Update for immediate feedback
+            if idx == 0: self.state['long_name'] = payload['long_name']
+            elif idx == 1: self.state['short_name'] = payload['short_name']
+            elif idx == 2: self.state['hop_limit'] = payload['hop_limit']
+            
+            resp = requests.post(f"{API_URL}/api/config/apply", json=payload, timeout=10)
+            if resp.status_code == 200:
+                self.config_status = "Saved!"
+            else:
+                self.config_status = f"Err: {resp.status_code}"
+        except Exception as e:
+            self.config_status = f"Error: {str(e)[:10]}"
+        
+        self.config_saving = False
+        self.config_status_time = time.time()
+
     def run(self):
         self.stdscr.nodelay(True)
         self.stdscr.timeout(500)
@@ -247,7 +287,7 @@ class MeshTUI:
                                         'fromId': self.state.get('local_id'),
                                         'toId': '^all' if isinstance(self.active_channel, int) else self.active_channel,
                                         'text': self.input_text.strip(),
-                                        'hopLimit': 3 # Default local hop limit
+                                        'hopLimit': self.state.get('hop_limit', 3) 
                                     })
                                 except:
                                     pass # suppress crash, UI will just not show the echo if it fails
@@ -265,21 +305,24 @@ class MeshTUI:
                         if c == 27: # ESC
                             self.config_mode = False
                         elif c == 9: # TAB
-                            self.config_idx = (self.config_idx + 1) % 3
+                            self.config_idx = (self.config_idx + 1) % 4
                         elif c in (10, 13): # ENTER
                             payload = {}
-                            if self.config_idx == 0: payload['long_name'] = self.config_buffers[0]
-                            elif self.config_idx == 1: payload['short_name'] = self.config_buffers[1]
-                            elif self.config_idx == 2: payload['command'] = self.config_buffers[2]
+                            field_val = self.config_buffers[self.config_idx].strip()
+                            if self.config_idx == 0: payload['long_name'] = field_val
+                            elif self.config_idx == 1: payload['short_name'] = field_val
+                            elif self.config_idx == 2: 
+                                try: payload['hop_limit'] = int(field_val or 3)
+                                except: payload['hop_limit'] = 3
+                            elif self.config_idx == 3: payload['command'] = field_val
                             
-                            try:
-                                requests.post(f"{API_URL}/api/config/apply", json=payload)
-                                self.config_status = "Saved!"
-                            except:
-                                self.config_status = "Error!"
-                            self.config_status_time = time.time()
-                            if self.config_idx == 2: self.config_buffers[2] = ""
-                            else: self.config_mode = False
+                            # Start non-blocking save
+                            threading.Thread(target=self.save_config_async, args=(payload, self.config_idx), daemon=True).start()
+                            
+                            if self.config_idx == 3: 
+                                self.config_buffers[3] = "" 
+                            else: 
+                                self.config_mode = False
                         elif c in (curses.KEY_BACKSPACE, 127, 8):
                             self.config_buffers[self.config_idx] = self.config_buffers[self.config_idx][:-1]
                         elif 32 <= c <= 126:
@@ -290,7 +333,12 @@ class MeshTUI:
                         elif c == ord('c') or c == ord('C'):
                             self.config_mode = True
                             self.config_idx = 0
-                            self.config_buffers = [self.state.get('long_name', ''), self.state.get('short_name', ''), '']
+                            self.config_buffers = [
+                                self.state.get('long_name', ''), 
+                                self.state.get('short_name', ''), 
+                                str(self.state.get('hop_limit', 3)), 
+                                ''
+                            ]
                         elif c == 9: # TAB
                             # Cycle channels (0-7 standard) + DM nodes
                             dm_list = list(self.dm_nodes.keys())
