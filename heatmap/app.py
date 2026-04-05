@@ -7,6 +7,8 @@ import meshtastic
 import meshtastic.serial_interface
 from pubsub import pub
 from google.protobuf.json_format import MessageToDict
+import json
+import os
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)
@@ -14,6 +16,27 @@ CORS(app)
 # Global dictionaries
 nodes_data = {}
 events = deque(maxlen=200)
+MESSAGES_FILE = 'messages.json'
+
+def save_events():
+    try:
+        # Use a temporary file and rename to ensure atomic write
+        tmp_file = MESSAGES_FILE + ".tmp"
+        with open(tmp_file, 'w') as f:
+            json.dump(list(events), f)
+        os.replace(tmp_file, MESSAGES_FILE)
+    except Exception as e:
+        print(f"Error saving messages: {e}")
+
+def load_events():
+    if os.path.exists(MESSAGES_FILE):
+        try:
+            with open(MESSAGES_FILE, 'r') as f:
+                saved = json.load(f)
+                events.extend(saved)
+                print(f"Loaded {len(saved)} messages from history.")
+        except Exception as e:
+            print(f"Error loading messages: {e}")
 
 interface = None
 
@@ -45,6 +68,7 @@ def add_event(msg_or_dict):
         events.append(clean_dict)
     else:
         events.append({'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'})
+    save_events()
 
 def init_node_data(interface):
     local_id = None
@@ -464,11 +488,32 @@ def api_send():
             interface.sendText(msg, destinationId=dest)
         else:
             interface.sendText(msg)
+            
+        # Log the sent message to local history so it shows up in TUI/heatmap
+        local_id = getattr(interface, 'myId', 'Local')
+        name = "Local"
+        try:
+            my_user = interface.getMyUser()
+            if my_user:
+                name = my_user.get('longName', my_user.get('shortName', 'Local'))
+        except:
+            pass
+
+        add_event({
+            'type': 'text',
+            'from': name,
+            'fromId': local_id,
+            'toId': dest or 'All',
+            'text': msg,
+            'message': f"[SENT] To: {dest or 'All'} -> {msg}"
+        })
+        
         return jsonify({'status': 'ok'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    load_events()
     connect_radio()
     print("Starting map & daemon server at http://localhost:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
