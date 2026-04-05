@@ -167,6 +167,10 @@ def on_receive(packet, interface):
             decoded = packet['decoded']
             portnum = decoded.get('portnum')
             
+            # Skip local echo from the radio firmware to avoid duplication
+            if from_id == local_id and portnum == 'TEXT_MESSAGE_APP':
+                return
+
             if portnum == 'TEXT_MESSAGE_APP':
                 text = decoded.get('text', '')
                 if not text and 'payload' in decoded:
@@ -379,6 +383,31 @@ def api_state():
         'server_time': time.time()
     }
     return jsonify(state)
+
+@app.route('/api/nodes', methods=['GET'])
+def api_nodes():
+    if not interface or not interface.nodes:
+        return jsonify([])
+    
+    nodes_list = []
+    with nodes_lock:
+        for node_id, info in interface.nodes.items():
+            user = info.get('user', {})
+            # Use the snr from our live tracked data if available, else from the nodeDB
+            live_data = nodes_data.get(node_id, {})
+            
+            nodes_list.append({
+                'id': node_id,
+                'long_name': user.get('longName', node_id),
+                'short_name': user.get('shortName', "??"),
+                'last_heard': info.get('lastHeard', 0),
+                'snr': live_data.get('snr', info.get('snr', -10)),
+                'rssi': live_data.get('rssi', info.get('rssi', -100))
+            })
+    
+    # Sort by last heard (most recently active first)
+    nodes_list.sort(key=lambda x: x['last_heard'] or 0, reverse=True)
+    return jsonify(nodes_list)
 
 @app.route('/api/config/apply', methods=['POST'])
 def api_config_apply():
