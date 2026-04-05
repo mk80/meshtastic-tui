@@ -4,6 +4,7 @@ import requests
 import threading
 
 API_URL = "http://localhost:5000"
+BROADCAST_ADDRS = ('^all', '^local', '!ffffffff')
 
 class MeshTUI:
     def __init__(self, stdscr):
@@ -32,6 +33,8 @@ class MeshTUI:
         self.config_status_time = 0
         self.unread_tabs = set()
         self.last_event_time = 0.0
+        self.last_server_time = 0.0
+        self.offline_mode = False
         self.running = True
 
     def fetch_data(self):
@@ -40,41 +43,53 @@ class MeshTUI:
                 # Fetch state
                 r_state = requests.get(f"{API_URL}/api/state", timeout=2)
                 if r_state.status_code == 200:
-                    self.state = r_state.json()
+                    self.offline_mode = False
+                    new_state = r_state.json()
+                    
+                    # Detect Daemon Restart
+                    server_time = new_state.get('server_time', 0.0)
+                    if server_time < self.last_server_time:
+                        # Daemon likely restarted, reset sync
+                        self.last_event_time = 0.0
+                        self.messages = []
+                        self.neighbor_events = []
+                    self.last_server_time = server_time
+                    self.state = new_state
+                else:
+                    self.offline_mode = True
                     
                 # Fetch stream
                 r_stream = requests.get(f"{API_URL}/api/stream?since={self.last_event_time}", timeout=2)
                 if r_stream.status_code == 200:
                     events = r_stream.json()
                     for e in events:
-                        self.last_event_time = max(self.last_event_time, e['time'])
+                        self.last_event_time = max(self.last_event_time, e.get('time', 0.0))
                         if e.get('type') == 'text':
-                            # DM Detection: if toId is not a broadcast ID
                             ch = e.get('channel', 0)
                             from_id = e.get('fromId')
                             to_id = e.get('toId')
                             local_id = self.state.get('local_id')
                             
-                            # Is it a DM?
-                            is_dm = to_id not in ('^all', '^local', '!ffffffff')
+                            is_dm = to_id not in BROADCAST_ADDRS
                             partner_id = from_id if from_id != local_id else to_id
                             tab_id = partner_id if is_dm else ch
                             
-                            # Skip unread for our own messages
                             if tab_id != self.active_channel and from_id != local_id:
                                 self.unread_tabs.add(tab_id)
                             
-                            # Add new DM nodes to manager if we are talking to them
                             if is_dm:
                                 target = from_id if from_id != local_id else to_id
                                 if target and target not in self.dm_nodes:
                                     self.dm_nodes[target] = e.get('from', target) if from_id != local_id else target
                             
+                            # Deduplicate by time if needed, but for now just append
                             self.messages.append(e)
                         elif e.get('type') == 'position':
                             self.neighbor_events.append(e)
+                else:
+                    self.offline_mode = True
             except Exception:
-                pass
+                self.offline_mode = True
             time.sleep(1)
 
     def safe_addstr(self, y, x, text, attr=0):
@@ -83,203 +98,121 @@ class MeshTUI:
         except curses.error:
             pass
 
-    def draw(self):
-        self.stdscr.erase()
-        h, w = self.stdscr.getmaxyx()
-        
-        if w < 60 or h < 15:
-            self.safe_addstr(0, 0, "Terminal too small!")
-            self.stdscr.refresh()
-            return
-            
-        mid_x = w // 2
-        split1 = h // 4
-        split2 = (h * 2) // 4
-        split3 = (h * 3) // 4
-        
-        # Draw Borders
-        self.stdscr.hline(0, 0, curses.ACS_HLINE, w)
-        self.stdscr.hline(h - 1, 0, curses.ACS_HLINE, w) # Bottom border
-        self.stdscr.vline(0, 0, curses.ACS_VLINE, h)
-        self.stdscr.vline(0, w - 1, curses.ACS_VLINE, h)
-        
-        # Split vertical
-        self.stdscr.vline(0, mid_x, curses.ACS_VLINE, h)
-        # Left side horizontal splits
-        self.stdscr.hline(split1, 0, curses.ACS_HLINE, mid_x)
-        self.stdscr.hline(split2, 0, curses.ACS_HLINE, mid_x)
-        self.stdscr.hline(split3, 0, curses.ACS_HLINE, mid_x)
-        
-        # T-Junctions
-        try:
-            self.stdscr.addch(0, mid_x, curses.ACS_TTEE)
-            self.stdscr.addch(h - 1, mid_x, curses.ACS_BTEE)
-            self.stdscr.addch(split1, 0, curses.ACS_LTEE)
-            self.stdscr.addch(split1, mid_x, curses.ACS_RTEE)
-            self.stdscr.addch(split2, 0, curses.ACS_LTEE)
-            self.stdscr.addch(split2, mid_x, curses.ACS_RTEE)
-            self.stdscr.addch(split3, 0, curses.ACS_LTEE)
-            self.stdscr.addch(split3, mid_x, curses.ACS_RTEE)
-        except curses.error:
-            pass
-        
+    def draw_sidebar(self, h, mid_x, split1, split2, split3):
+        # Radio Stats
         self.safe_addstr(0, 2, " Radio Stats ", curses.color_pair(1) | curses.A_BOLD)
-        self.safe_addstr(split1, 2, " GPS Status ", curses.color_pair(2) | curses.A_BOLD)
-        self.safe_addstr(split2, 2, " Node Neighbors ", curses.color_pair(3) | curses.A_BOLD)
-        self.safe_addstr(split3, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
-        if isinstance(self.active_channel, int):
-            ch_name = self.channels.get(self.active_channel, str(self.active_channel))
-        else:
-            ch_name = self.dm_nodes.get(self.active_channel, self.active_channel)
-            
-        # Message header
-        unread_str = ""
-        if self.unread_tabs:
-            unread_list = []
-            for ut in sorted(list(self.unread_tabs), key=lambda x: str(x)):
-                if isinstance(ut, int):
-                    unread_list.append(str(ut))
-                else:
-                    # truncate node ID or use name if available
-                    name = self.dm_nodes.get(ut, ut[-4:])
-                    unread_list.append(name)
-            unread_str = f" [Unread: {', '.join(unread_list)}]"
-
-        header_text = f" Messages ({'Channel' if isinstance(self.active_channel, int) else 'DM'}: {ch_name}){unread_str} "
-        self.safe_addstr(0, mid_x + 2, header_text, curses.color_pair(2) | curses.A_BOLD)
-        
-        if unread_str:
-            # Highlight unread count in red if any
-            self.safe_addstr(0, mid_x + 2 + header_text.find("[Unread:"), unread_str, curses.color_pair(4) | curses.A_BOLD)
-        
-        # Populate Radio Stats
         self.safe_addstr(2, 2, f"Device: {self.state.get('name', 'Unknown')}")
         self.safe_addstr(3, 2, f"Local ID: {self.state.get('local_id', 'Unknown')}")
-        
         uptime = self.state.get('uptime', 0)
         uptime_str = f"{uptime//3600}h {(uptime%3600)//60}m"
         self.safe_addstr(4, 2, f"Uptime: {uptime_str}")
-        
         self.safe_addstr(5, 2, f"Battery: {self.state.get('battery_level', 0)}% ({self.state.get('battery_voltage', 0.0)}V)")
         self.safe_addstr(6, 2, f"ChUtil: {self.state.get('chutil', 0.0):.2f}%")
         self.safe_addstr(7, 2, f"Nodes Online: {self.state.get('nodes_online', 0)}")
         
-        # Populate GPS
+        # GPS Status
+        self.safe_addstr(split1, 2, " GPS Status ", curses.color_pair(2) | curses.A_BOLD)
         sats = self.state.get('sats', 0)
+        gps_live = self.state.get('gps_live', False)
         color = curses.color_pair(1) if sats >= 3 else curses.color_pair(3)
-        self.safe_addstr(split1 + 2, 2, f"Satellites: {sats}", color)
+        self.safe_addstr(split1 + 2, 2, f"Sats In View: {sats}", color)
         
         lat = self.state.get('latitude', 0.0)
         lon = self.state.get('longitude', 0.0)
-        status_text = "Acquiring..." if lat == 0.0 else f"Locked"
+        status_text = "Acquiring..." if lat == 0.0 else ("Locked" if gps_live else "Cached (awaiting live fix)")
         self.safe_addstr(split1 + 3, 2, f"Lat: {lat:.5f}")
         self.safe_addstr(split1 + 4, 2, f"Lon: {lon:.5f}")
-        
         pdop = self.state.get('pdop', 0) / 100.0
-        self.safe_addstr(split1 + 6, 2, f"Precision: {pdop}m")
+        self.safe_addstr(split1 + 6, 2, f"Precision: {pdop:.2f}m")
         self.safe_addstr(split1 + 7, 2, f"Status: {status_text}", color)
         
-        # Populate Node Neighbors
+        # Node Neighbors
+        self.safe_addstr(split2, 2, " Node Neighbors ", curses.color_pair(3) | curses.A_BOLD)
         tel_y = split2 + 2
-        max_tel_msgs = split3 - split2 - 2
-        
-        show_tel = self.neighbor_events[-max_tel_msgs:]
-        for t in show_tel:
+        max_tel = split3 - split2 - 2
+        for t in self.neighbor_events[-max_tel:]:
             sender = t.get('from', 'Unknown')
             pos = t.get('pos', {})
-            
-            lat = pos.get('latitude', 0.0)
-            lon = pos.get('longitude', 0.0)
-            
-            hop = t.get('hopLimit')
-            hop_str = f"({hop})" if hop is not None else ""
-            line_str = f"{sender}{hop_str}: {lat:.4f}, {lon:.4f}"
-            
-            # Show Sats if available
-            sats = pos.get('satsInView')
-            if sats is not None:
-                line_str += f" ({sats}s)"
-
-            max_len = mid_x - 4
-            if len(line_str) > max_len:
-                line_str = line_str[:max_len-3] + "..."
-                
-            self.safe_addstr(tel_y, 2, line_str)
+            line = f"{sender}: {pos.get('latitude', 0.0):.4f}, {pos.get('longitude', 0.0):.4f}"
+            self.safe_addstr(tel_y, 2, line[:mid_x-4])
             tel_y += 1
             
-        # Draw Configuration Pane
+        # Device Config
+        self.safe_addstr(split3, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
         conf_y = split3 + 1
         fields = ["Long Name", "Short Name", "CLI Command"]
         for i, field in enumerate(fields):
             color = curses.color_pair(1) if (self.config_mode and self.config_idx == i) else 0
             label = f"{field}: "
             self.safe_addstr(conf_y + i, 2, label)
-            
             val = self.config_buffers[i] if self.config_mode else (self.state.get('long_name') if i == 0 else (self.state.get('short_name') if i == 1 else ""))
-            
-            # Ensure val is a string
-            val_str = str(val) if val is not None else ""
-            self.safe_addstr(conf_y + i, 2 + len(label), val_str, color)
-            
-        if self.config_status and time.time() - self.config_status_time < 3:
-            self.safe_addstr(split3, mid_x - len(self.config_status) - 2, f" {self.config_status} ", curses.color_pair(2) | curses.A_BOLD)
-        elif not self.config_mode:
-            self.safe_addstr(h - 2, 2, "Press 'C' to Config", curses.A_DIM)
+            self.safe_addstr(conf_y + i, 2 + len(label), str(val or "")[:mid_x-len(label)-3], color)
+
+    def draw_messages(self, h, w, mid_x):
+        ch_name = self.channels.get(self.active_channel) if isinstance(self.active_channel, int) else self.dm_nodes.get(self.active_channel, self.active_channel)
+        header = f" Messages ({'Channel' if isinstance(self.active_channel, int) else 'DM'}: {ch_name}) "
+        self.safe_addstr(0, mid_x + 2, header, curses.color_pair(2) | curses.A_BOLD)
         
-        # Populate Messages
-        msg_y = 2
-        max_msgs = h - 6 # account for headers and input bar
-        
+        if self.unread_tabs:
+            unread_str = f" [Unread: {len(self.unread_tabs)}] "
+            self.safe_addstr(0, w - len(unread_str) - 2, unread_str, curses.color_pair(4) | curses.A_BOLD)
+
         local_id = self.state.get('local_id')
         if isinstance(self.active_channel, int):
-            # Show only BROADCAST messages for this channel
-            filtered = [m for m in self.messages if m.get('channel') == self.active_channel and m.get('toId') in ('^all', '^local', '!ffffffff')]
+            filtered = [m for m in self.messages if m.get('channel') == self.active_channel and m.get('toId') in BROADCAST_ADDRS]
         else:
-            # Show only DMs between us and this specific node
             filtered = [m for m in self.messages if (m.get('fromId') == self.active_channel and m.get('toId') == local_id) or (m.get('fromId') == local_id and m.get('toId') == self.active_channel)]
 
-        show_msgs = filtered[-max_msgs:]
-        
-        for m in show_msgs:
+        msg_y = 2
+        max_msgs = h - 6
+        for m in filtered[-max_msgs:]:
             sender = m.get('from', 'Unknown')
-            text = m.get('text', '')
-            
-            # Use different colors for names
-            if sender == 'You':
-                name_color = curses.color_pair(1) | curses.A_BOLD
-            elif not isinstance(self.active_channel, int):
-                name_color = curses.color_pair(3) | curses.A_BOLD # Yellow for DM partner
-            else:
-                name_color = curses.color_pair(2) | curses.A_BOLD # Cyan for channel members
-
-            # Truncate to fit inside the pane cleanly
-            max_len = w - mid_x - 3
+            name_color = curses.color_pair(1)|curses.A_BOLD if sender == 'You' else (curses.color_pair(3)|curses.A_BOLD if not isinstance(self.active_channel, int) else curses.color_pair(2)|curses.A_BOLD)
             hop = m.get('hopLimit')
-            hop_str = f"({hop})" if hop is not None else ""
-            display_name = f"{sender}{hop_str}: "
-            if len(display_name + text) > max_len:
-                text = text[:max_len - len(display_name) - 3] + "..."
-            
+            display_name = f"{sender}{f'({hop})' if hop is not None else ''}: "
+            text = m.get('text', '')
+            available_w = w - mid_x - len(display_name) - 4
             self.safe_addstr(msg_y, mid_x + 2, display_name, name_color)
-            self.safe_addstr(msg_y, mid_x + 2 + len(display_name), text)
+            self.safe_addstr(msg_y, mid_x + 2 + len(display_name), text[:available_w])
             msg_y += 1
-            
-        # Draw Input Bar
+
+    def draw_input(self, h, mid_x, w):
         self.stdscr.hline(h-4, mid_x + 1, curses.ACS_HLINE, w - mid_x - 2)
         if self.input_mode:
             prompt = "Type message: "
-            text = self.input_text
-            self.safe_addstr(h-3, mid_x + 2, prompt + text)
-            # Show simulated cursor
+            self.safe_addstr(h-3, mid_x + 2, prompt + self.input_text)
             curses.curs_set(1)
-            try:
-                self.stdscr.move(h-3, mid_x + 2 + len(prompt) + len(text))
-            except curses.error:
-                pass
+            try: self.stdscr.move(h-3, mid_x + 2 + len(prompt) + len(self.input_text))
+            except: pass
         else:
             curses.curs_set(0)
-            self.safe_addstr(h-3, mid_x + 2, "[ENTER to chat] [TAB channel] [Q quit]", curses.color_pair(3))
+            self.safe_addstr(h-3, mid_x + 2, "[ENTER to message] [TAB channel/DM] [C config] [Q quit]", curses.color_pair(3))
 
+    def draw(self):
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        if w < 70 or h < 15:
+            self.safe_addstr(0, 0, "Terminal too small!")
+            self.stdscr.refresh(); return
+            
+        mid_x = w // 2
+        split1, split2, split3 = h // 4, (h * 2) // 4, (h * 3) // 4
+        
+        # Borders and Frames
+        try:
+            self.stdscr.box()
+            self.stdscr.vline(1, mid_x, curses.ACS_VLINE, h - 2)
+            self.stdscr.hline(split1, 1, curses.ACS_HLINE, mid_x - 1)
+            self.stdscr.hline(split2, 1, curses.ACS_HLINE, mid_x - 1)
+            self.stdscr.hline(split3, 1, curses.ACS_HLINE, mid_x - 1)
+        except: pass
+        
+        if self.offline_mode:
+            self.safe_addstr(0, w - 20, " [ DAEMON OFFLINE ] ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
+
+        self.draw_sidebar(h, mid_x, split1, split2, split3)
+        self.draw_messages(h, w, mid_x)
+        self.draw_input(h, mid_x, w)
         self.stdscr.refresh()
 
     def run(self):
@@ -303,18 +236,22 @@ class MeshTUI:
                                 if not isinstance(self.active_channel, int):
                                     payload["destination"] = self.active_channel
                                     
-                                requests.post(f"{API_URL}/api/send", json=payload)
-                                
-                                # local echo
-                                self.messages.append({
-                                    'time': time.time(), 
-                                    'channel': self.active_channel if isinstance(self.active_channel, int) else 0, 
-                                    'from': 'You', 
-                                    'fromId': self.state.get('local_id'),
-                                    'toId': '^all' if isinstance(self.active_channel, int) else self.active_channel,
-                                    'text': self.input_text.strip(),
-                                    'hopLimit': 3 # Default local hop limit
-                                })
+                                try:
+                                    requests.post(f"{API_URL}/api/send", json=payload, timeout=2)
+                                    
+                                    # local echo
+                                    self.messages.append({
+                                        'time': time.time(), 
+                                        'channel': self.active_channel if isinstance(self.active_channel, int) else 0, 
+                                        'from': 'You', 
+                                        'fromId': self.state.get('local_id'),
+                                        'toId': '^all' if isinstance(self.active_channel, int) else self.active_channel,
+                                        'text': self.input_text.strip(),
+                                        'hopLimit': 3 # Default local hop limit
+                                    })
+                                except:
+                                    pass # suppress crash, UI will just not show the echo if it fails
+                                    
                                 self.input_text = ""
                             self.input_mode = False
                         elif c == 27: # ESC

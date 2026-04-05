@@ -17,7 +17,7 @@ def start_daemon():
     # Run app.py in background, redirecting output to a log file
     log = open('daemon.log', 'w')
     # Use cwd to run the flask app correctly relative to its static folder
-    proc = subprocess.Popen(['python3', 'app.py'], stdout=log, stderr=subprocess.STDOUT, cwd='heatmap')
+    proc = subprocess.Popen([sys.executable, 'app.py'], stdout=log, stderr=subprocess.STDOUT, cwd='heatmap')
     with open('.daemon.pid', 'w') as f:
         f.write(str(proc.pid))
     
