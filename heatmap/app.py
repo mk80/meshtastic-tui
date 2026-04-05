@@ -1,3 +1,4 @@
+import logging
 import time
 import threading
 from collections import deque
@@ -10,18 +11,34 @@ from google.protobuf.json_format import MessageToDict
 import json
 import os
 
+# Create log file before configuring logging
+logfile = 'daemon.log'
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(logfile, mode='w'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('daemon')
+
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)
 
-# Global dictionaries
+# Global constants and state
+BROADCAST_ADDRS = ('^all', '^local', '!ffffffff')
 nodes_data = {}
-events = deque(maxlen=200)
+nodes_lock = threading.Lock()
+events = deque(maxlen=10) # User requested 10 recent messages limit
 events_lock = threading.Lock()
 MESSAGES_FILE = 'messages.json'
+interface = None
 
 def save_events():
     try:
-        # Use a temporary file and rename to ensure atomic write
         tmp_file = MESSAGES_FILE + ".tmp"
         with events_lock:
             data = list(events)
@@ -29,21 +46,57 @@ def save_events():
             json.dump(data, f)
         os.replace(tmp_file, MESSAGES_FILE)
     except Exception as e:
-        print(f"Error saving messages: {e}")
+        logger.error(f"Error saving messages: {e}")
 
 def load_events():
-    if os.path.exists(MESSAGES_FILE):
-        try:
-            with open(MESSAGES_FILE, 'r') as f:
-                saved = json.load(f)
-                with events_lock:
-                    events.clear()
-                    events.extend(saved)
-                print(f"Loaded {len(saved)} messages from history.")
-        except Exception as e:
-            print(f"Error loading messages: {e}")
+    if not os.path.exists(MESSAGES_FILE):
+        return
+    try:
+        with open(MESSAGES_FILE, 'r') as f:
+            saved = json.load(f)
+            with events_lock:
+                events.clear()
+                events.extend(saved)
+            logger.info(f"Loaded {len(events)} (out of {len(saved)} on disk) messages into recent history.")
+    except Exception as e:
+        logger.error(f"Error loading messages: {e}")
 
-interface = None
+def get_local_node_id():
+    """Robustly fetch the local node's ID from the interface."""
+    if not interface: return None
+    if hasattr(interface, 'myId') and interface.myId:
+        return interface.myId
+    try:
+        info = interface.getMyNodeInfo()
+        return info.get('user', {}).get('id')
+    except:
+        return None
+
+def get_display_name(node_id):
+    """Resolve a node ID to its LongName, ShortName, or Fallback to ID."""
+    if not node_id or not interface: return "Unknown"
+    
+    # Try the connected radio's cache first
+    try:
+        if node_id in interface.nodes:
+            user = interface.nodes[node_id].get('user', {})
+            name = user.get('longName') or user.get('shortName')
+            if name: return name
+            
+        # If it's the local node, getMyUser often has fresher data
+        if node_id == get_local_node_id():
+            my_user = interface.getMyUser()
+            if my_user:
+                return getattr(my_user, 'longName', getattr(my_user, 'shortName', node_id))
+    except Exception:
+        pass
+        
+    # Final fallback to our own tracked nodes_data
+    with nodes_lock:
+        if node_id in nodes_data:
+            return nodes_data[node_id].get('name', node_id)
+            
+    return node_id
 
 def proto_to_dict(obj):
     if hasattr(obj, 'DESCRIPTOR'):
@@ -78,36 +131,28 @@ def add_event(msg_or_dict):
     save_events()
 
 def init_node_data(interface):
-    local_id = None
-    try:
-        local_node = interface.getMyNodeInfo()
-        if local_node and 'user' in local_node:
-            local_id = local_node['user'].get('id')
-        if not local_id and hasattr(interface, 'myId'):
-            local_id = interface.myId
-    except Exception:
-        pass
-
+    local_id = get_local_node_id()
     if interface.nodes:
-        for node_id, info in interface.nodes.items():
-            user = info.get('user', {})
-            pos = normalize_pos(info.get('position', {}))
-            snr = info.get('snr', -10)
-            
-            if 'latitude' in pos and 'longitude' in pos:
-                nodes_data[node_id] = {
-                    'id': node_id,
-                    'is_local': (node_id == local_id),
-                    'name': user.get('longName', user.get('shortName', node_id)),
-                    'latitude': pos.get('latitude'),
-                    'longitude': pos.get('longitude'),
-                    'sats': pos.get('satsInView', 0),
-                    'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
-                    'snr': snr,
-                    'rssi': -100, # default weak rssi
-                    'source': 'init', # seeded from cached mesh DB — may be stale
-                    'last_updated': time.time()
-                }
+        with nodes_lock:
+            for node_id, info in interface.nodes.items():
+                user = info.get('user', {})
+                pos = normalize_pos(info.get('position', {}))
+                snr = info.get('snr', -10)
+                
+                if 'latitude' in pos and 'longitude' in pos:
+                    nodes_data[node_id] = {
+                        'id': node_id,
+                        'is_local': (node_id == local_id),
+                        'name': user.get('longName', user.get('shortName', node_id)),
+                        'latitude': pos.get('latitude'),
+                        'longitude': pos.get('longitude'),
+                        'sats': pos.get('satsInView', 0),
+                        'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
+                        'snr': snr,
+                        'rssi': -100,
+                        'source': 'init',
+                        'last_updated': time.time()
+                    }
 
 def on_receive(packet, interface):
     try:
@@ -115,38 +160,8 @@ def on_receive(packet, interface):
         rxSnr = packet.get('rxSnr', -10)
         rxRssi = packet.get('rxRssi', -100)
         hopLimit = packet.get('hopLimit')
-        
-        # Consistent local_id detection
-        local_id = None
-        try:
-            if hasattr(interface, 'myId'):
-                local_id = interface.myId
-            else:
-                l_info = interface.getMyNodeInfo() or {}
-                local_id = l_info.get('user', {}).get('id')
-        except:
-            pass
-
-        # NOTE: Do NOT substitute None fromId here globally - only POSITION_APP
-        # packets reliably come from the local radio with no fromId. Text/telemetry
-        # packets with missing fromId should safely fall back to 'Unknown'.
-        display_from_id = from_id or 'Unknown'
-
-        name = display_from_id
-        if display_from_id == local_id:
-            # For the local node, use our specialized name resolver
-            try:
-                my_user = interface.getMyUser()
-                if my_user:
-                    u = proto_to_dict(my_user)
-                    name = u.get('longName', u.get('shortName', display_from_id))
-            except:
-                pass
-        
-        # Fallback to general nodes list if name is still ID
-        if name == display_from_id and hasattr(interface, 'nodes') and display_from_id in interface.nodes:
-            user_info = interface.nodes[display_from_id].get('user', {})
-            name = user_info.get('longName', user_info.get('shortName', display_from_id))
+        local_id = get_local_node_id()
+        name = get_display_name(from_id)
 
         if 'decoded' in packet:
             decoded = packet['decoded']
@@ -160,48 +175,39 @@ def on_receive(packet, interface):
                     'type': 'text',
                     'channel': packet.get('channel', 0),
                     'from': name,
-                    'fromId': display_from_id,
+                    'fromId': from_id or 'Unknown',
                     'toId': packet.get('toId', 'Unknown'),
                     'text': text,
                     'hopLimit': hopLimit,
                     'message': f"[TEXT MESSAGE] From: {name} -> {text}"
                 })
-                
             elif portnum == 'TELEMETRY_APP':
                 telemetry = decoded.get('telemetry', {})
                 add_event({
                     'type': 'telemetry',
                     'from': name,
-                    'fromId': display_from_id,
+                    'fromId': from_id or 'Unknown',
                     'telemetry': telemetry,
                     'message': f"[TELEMETRY] From: {name} -> {telemetry}"
                 })
-                
             elif portnum == 'NODEINFO_APP':
                 user = decoded.get('user', {})
                 add_event({
                     'type': 'nodeinfo',
                     'from': name,
-                    'fromId': display_from_id,
+                    'fromId': from_id or 'Unknown',
                     'user': user,
                     'message': f"[NODE INFO] From: {name} -> {user.get('longName')} ({user.get('shortName')})"
                 })
-
-            # Update heatmap if position
-            if portnum == 'POSITION_APP':
+            elif portnum == 'POSITION_APP':
                 raw_pos = decoded.get('position', {})
                 pos = normalize_pos(raw_pos)
 
-                # Drop packets with no sender ID entirely.
-                # A None fromId can come from ANY relayed/corrupted mesh packet —
-                # not just our own radio. Our local GPS is now handled solely by
-                # local_gps_poller reading interface.nodes[myId] directly.
                 if not from_id:
-                    print(f"DEBUG_GPS: dropping no-sender position packet (pos={pos})", flush=True)
+                    logger.debug(f"Missing fromId in position packet: {pos}")
                 else:
-                    position_is_local = (from_id == local_id)
-                    print(f"DEBUG_GPS: id={from_id}, is_local={position_is_local}, name={name}, pos={pos}", flush=True)
-
+                    is_local = (from_id == local_id)
+                    logger.debug(f"Position Update: id={from_id}, is_local={is_local}, name={name}")
                     add_event({
                         'type': 'position',
                         'from': name,
@@ -211,84 +217,73 @@ def on_receive(packet, interface):
                         'message': f"[POSITION] From: {name} -> Lat: {pos.get('latitude')}, Lon: {pos.get('longitude')}"
                     })
                     if 'latitude' in pos and 'longitude' in pos:
-                        nodes_data[from_id] = {
-                            'id': from_id,
-                            'is_local': position_is_local,
-                            'name': name,
-                            'latitude': pos['latitude'],
-                            'longitude': pos['longitude'],
-                            'sats': pos.get('satsInView', 0),
-                            'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
-                            'snr': rxSnr,
-                            'rssi': rxRssi,
-                            'source': 'live',
-                            'last_updated': time.time()
-                        }
-            elif display_from_id in nodes_data:
-                nodes_data[display_from_id]['snr'] = rxSnr
-                nodes_data[display_from_id]['rssi'] = rxRssi
-                nodes_data[display_from_id]['last_updated'] = time.time()
+                        with nodes_lock:
+                            nodes_data[from_id] = {
+                                'id': from_id,
+                                'is_local': is_local,
+                                'name': name,
+                                'latitude': pos['latitude'],
+                                'longitude': pos['longitude'],
+                                'sats': pos.get('satsInView', 0),
+                                'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
+                                'snr': rxSnr,
+                                'rssi': rxRssi,
+                                'source': 'live',
+                                'last_updated': time.time()
+                            }
+            elif from_id:
+                with nodes_lock:
+                    if from_id in nodes_data:
+                        nodes_data[from_id]['snr'] = rxSnr
+                        nodes_data[from_id]['rssi'] = rxRssi
+                        nodes_data[from_id]['last_updated'] = time.time()
+                
+    except Exception as e:
+        logger.error(f"Error handling packet: {e}")
                 
     except Exception as e:
         print(f"Error handling packet: {e}")
 
 def local_gps_poller():
-    """
-    Poll the Meshtastic library's internal node state every 15 seconds for the
-    local node's GPS. The library keeps interface.nodes[myId] updated via its
-    serial thread, independent of the mesh broadcast timer (position_broadcast_secs).
-    This means we get updated GPS within ~15s of a fix, not up to 15 minutes.
-    """
     while True:
         time.sleep(15)
-        if not interface:
-            continue
+        if not interface: continue
         try:
-            local_id = getattr(interface, 'myId', None)
-            if not local_id:
-                continue
-            if not hasattr(interface, 'nodes') or local_id not in interface.nodes:
+            local_id = get_local_node_id()
+            if not local_id or not hasattr(interface, 'nodes') or local_id not in interface.nodes:
                 continue
 
             pos = normalize_pos(interface.nodes[local_id].get('position', {}))
-            lat = pos.get('latitude')
-            lon = pos.get('longitude')
+            lat, lon = pos.get('latitude'), pos.get('longitude')
+            if not lat or not lon: continue
 
-            if not lat or not lon:
-                continue
-
-            existing = nodes_data.get(local_id, {})
-            # Promote to 'live' if: we only had stale init data, or coords changed
-            if (existing.get('source') == 'init'
-                    or lat != existing.get('latitude')
-                    or lon != existing.get('longitude')):
-                nodes_data[local_id] = {
-                    **existing,   # preserve is_local, name, snr, rssi
-                    'latitude': lat,
-                    'longitude': lon,
-                    'sats': pos.get('satsInView', existing.get('sats', 0)),
-                    'pdop': pos.get('PDOP', pos.get('HDOP', existing.get('pdop', 0))),
-                    'source': 'live',
-                    'last_updated': time.time(),
-                }
-                print(f"GPS_POLL: local GPS updated from library state → "
-                      f"{lat:.5f}, {lon:.5f}  sats={pos.get('satsInView', '?')}", flush=True)
+            with nodes_lock:
+                existing = nodes_data.get(local_id, {})
+                if (existing.get('source') == 'init' or lat != existing.get('latitude') or lon != existing.get('longitude')):
+                    nodes_data[local_id] = {
+                        **existing,
+                        'latitude': lat,
+                        'longitude': lon,
+                        'sats': pos.get('satsInView', existing.get('sats', 0)),
+                        'pdop': pos.get('PDOP', pos.get('HDOP', existing.get('pdop', 0))),
+                        'source': 'live',
+                        'last_updated': time.time(),
+                    }
+                    logger.info(f"Local GPS update: {lat:.5f}, {lon:.5f} (sats={pos.get('satsInView', '?')})")
         except Exception as e:
-            print(f"GPS poll error: {e}", flush=True)
+            logger.error(f"GPS poller error: {e}")
 
 def connect_radio():
     global interface
-    print("Connecting to Meshtastic...")
+    logger.info("Connecting to Meshtastic...")
     try:
         interface = meshtastic.serial_interface.SerialInterface()
         init_node_data(interface)
         pub.subscribe(on_receive, "meshtastic.receive")
-        # Start background GPS poller for the local node
-        t = threading.Thread(target=local_gps_poller, daemon=True)
-        t.start()
-        print(f"Connected! Seeded map with {len(nodes_data)} nodes.")
+        threading.Thread(target=local_gps_poller, daemon=True).start()
+        logger.info(f"Connected! Initialized with {len(nodes_data)} nodes.")
     except Exception as e:
-        print(f"Failed to connect to radio: {e}")
+        logger.error(f"Connection failed: {e}")
 
 
 @app.route('/')
@@ -297,7 +292,9 @@ def index():
 
 @app.route('/api/heatmap')
 def api_heatmap():
-    return jsonify(list(nodes_data.values()))
+    with nodes_lock:
+        data = list(nodes_data.values())
+    return jsonify(data)
 
 @app.route('/api/stream')
 def api_stream():
@@ -311,59 +308,28 @@ def api_state():
     if not interface:
         return jsonify({'error': 'Not connected'}), 500
         
-    local_id = None
-    node_info = {}
-    name = None
+    local_id = get_local_node_id() or "Unknown"
+    name = get_display_name(local_id)
     
+    # Get official protobuf state
+    node_info = {}
     try:
-        # Try multiple ways to get local node info
         node_info = interface.getMyNodeInfo() or {}
-        local_id = node_info.get('user', {}).get('id')
-        
-        # Fallback to interface.myId
-        if not local_id and hasattr(interface, 'myId'):
-            local_id = interface.myId
-            
-        # Try getMyUser()
-        try:
-            my_user = interface.getMyUser()
-            if my_user:
-                my_user_dict = proto_to_dict(my_user)
-                if isinstance(my_user_dict, dict):
-                    name = my_user_dict.get('longName', my_user_dict.get('shortName'))
-        except:
-            pass
-            
-        if not name and local_id in interface.nodes:
-            user_info = interface.nodes[local_id].get('user', {})
-            name = user_info.get('longName', user_info.get('shortName'))
-            
-        pass
     except:
         pass
-        
-    # Final fallback: check nodes_data if we have it
-    if not name and local_id in nodes_data:
-        name = nodes_data[local_id].get('name')
-    
-    if not name:
-        name = "Unknown"
 
     pos = node_info.get('position', {})
     metrics = node_info.get('deviceMetrics', {})
-    
     user_info = node_info.get('user', {})
-    long_name = user_info.get('longName', name)
-    short_name = user_info.get('shortName', "Unknown")
-
-    # Only use nodes_data for GPS if it came from a live POSITION_APP packet.
-    # 'init' entries are seeded from the cached mesh DB and may be stale.
-    live_gps = nodes_data.get(local_id, {}) if local_id else {}
+    
+    # Check our own tracked live data
+    with nodes_lock:
+        live_gps = nodes_data.get(local_id, {})
     use_live_gps = live_gps.get('source') == 'live'
 
     state = {
         'nodes_online': len(nodes_data),
-        'local_id': local_id or "Unknown",
+        'local_id': local_id,
         'uptime': metrics.get('uptimeSeconds', 0),
         'battery_voltage': metrics.get('voltage', 0.0),
         'battery_level': metrics.get('batteryLevel', 0),
@@ -372,12 +338,12 @@ def api_state():
         'pdop': live_gps.get('pdop') if use_live_gps else pos.get('PDOP', pos.get('HDOP', 0)),
         'latitude': live_gps.get('latitude') if use_live_gps else pos.get('latitude', 0.0),
         'longitude': live_gps.get('longitude') if use_live_gps else pos.get('longitude', 0.0),
-        'gps_live': use_live_gps, # let TUI know if GPS data is fresh
+        'gps_live': use_live_gps,
         'name': name,
-        'long_name': long_name,
-        'short_name': short_name,
+        'long_name': user_info.get('longName', name),
+        'short_name': user_info.get('shortName', "Unknown"),
+        'server_time': time.time() # Added for TUI resync detection
     }
-
     return jsonify(state)
 
 @app.route('/api/config/apply', methods=['POST'])
@@ -497,16 +463,8 @@ def api_send():
         else:
             interface.sendText(msg)
             
-        # Log the sent message to local history so it shows up in TUI/heatmap
-        local_id = getattr(interface, 'myId', 'Local')
-        name = "Local"
-        try:
-            my_user = interface.getMyUser()
-            if my_user:
-                # User objects are protobufs, they don't have .get()
-                name = getattr(my_user, 'longName', getattr(my_user, 'shortName', 'Local'))
-        except:
-            pass
+        local_id = get_local_node_id() or 'Local'
+        name = get_display_name(local_id)
 
         add_event({
             'type': 'text',
@@ -516,13 +474,13 @@ def api_send():
             'text': msg,
             'message': f"[SENT] To: {dest or 'All'} -> {msg}"
         })
-        
         return jsonify({'status': 'ok'})
     except Exception as e:
+        logger.error(f"Send failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     load_events()
     connect_radio()
-    print("Starting map & daemon server at http://localhost:5000")
+    logger.info("Daemon starting on 0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
