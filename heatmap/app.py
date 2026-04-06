@@ -41,7 +41,7 @@ def save_events():
     try:
         tmp_file = MESSAGES_FILE + ".tmp"
         with events_lock:
-            data = list(events)
+            data = [e for e in events if e.get('type') == 'text']
         with open(tmp_file, 'w') as f:
             json.dump(data, f)
         os.replace(tmp_file, MESSAGES_FILE)
@@ -379,7 +379,7 @@ def api_state():
         'name': name,
         'long_name': user_info.get('longName', name),
         'short_name': user_info.get('shortName', "Unknown"),
-        'hop_limit': getattr(lora_config, 'hopLimit', 3), # Expose hop limit
+        'hop_limit': getattr(lora_config, 'hop_limit', 3), # Expose hop limit
         'server_time': time.time()
     }
     return jsonify(state)
