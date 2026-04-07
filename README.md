@@ -30,6 +30,7 @@ Ensure your Meshtastic device is plugged in via USB and powered on.
 
 **Windows Users:**
 - No special permissions are needed. It will connect via a `COM` port. 
+- *Note:* If you intend to use the TUI (`tui.py`), Windows requires `windows-curses`. This should install automatically via the requirements file, but if you get a `no module named '_curses'` error, run: `pip install windows-curses`.
 - *Note:* If your computer doesn't recognize the radio, you may need to download the standard **CH340** or **CP210x** serial drivers depending on your specific board. Also, you may need to type `python` instead of `python3` for the commands below.
 
 **macOS Users:**
