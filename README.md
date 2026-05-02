@@ -52,6 +52,11 @@ python manager.py start
 ```
 *Wait a few seconds for it to report `Daemon successfully started (PID XXXX)!`*
 
+*Note:* By default, the daemon runs quietly and only logs essential events and errors to `daemon.log`. If you need to troubleshoot issues or want to see the full HTTP request logs, you can start the daemon with the `--debug` flag:
+```bash
+python manager.py start --debug
+```
+
 At this point, the radio is locked by the daemon, the internal cache has been fetched, and data is aggressively tracking.
 
 ### 4. View the Heatmap
