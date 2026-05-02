@@ -273,9 +273,15 @@ class MeshTUI:
     def draw(self):
         self.stdscr.erase()
         h, w = self.stdscr.getmaxyx()
-        if w < 70 or h < 15:
-            self.safe_addstr(0, 0, "Terminal too small!")
-            self.stdscr.refresh(); return
+        if w < 115 or h < 35:
+            msg1 = " Terminal window too small "
+            msg2 = " Please resize to at least 115x35 "
+            msg3 = f" Current size: {w}x{h} "
+            self.safe_addstr(max(0, h // 2 - 1), max(0, w // 2 - len(msg1) // 2), msg1, curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
+            self.safe_addstr(max(1, h // 2), max(0, w // 2 - len(msg2) // 2), msg2)
+            self.safe_addstr(max(2, h // 2 + 1), max(0, w // 2 - len(msg3) // 2), msg3)
+            self.stdscr.refresh()
+            return
             
         mid_x = w // 2
         split1, split2, split3 = h // 4, (h * 2) // 4, (h * 3) // 4
