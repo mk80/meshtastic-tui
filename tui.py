@@ -123,7 +123,8 @@ class MeshTUI:
         uptime = self.state.get('uptime', 0)
         uptime_str = f"{uptime//3600:,}h {(uptime%3600)//60}m"
         self.safe_addstr(4, 2, f"Uptime: {uptime_str}")
-        self.safe_addstr(5, 2, f"Battery: {self.state.get('battery_level', 0)}% ({self.state.get('battery_voltage', 0.0)}V)")
+        batt_level = min(100, self.state.get('battery_level', 0))
+        self.safe_addstr(5, 2, f"Battery: {batt_level}% ({self.state.get('battery_voltage', 0.0)}V)")
         self.safe_addstr(6, 2, f"ChUtil: {self.state.get('chutil', 0.0):.2f}%")
         self.safe_addstr(7, 2, f"Nodes Online: {self.state.get('nodes_online', 0)}")
         
