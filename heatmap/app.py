@@ -300,7 +300,12 @@ def connect_radio():
     global interface
     logger.info("Connecting to Meshtastic...")
     try:
-        interface = meshtastic.serial_interface.SerialInterface()
+        port = os.environ.get('MESHTASTIC_PORT')
+        if port:
+            logger.info(f"Using explicitly selected port: {port}")
+            interface = meshtastic.serial_interface.SerialInterface(devPath=port)
+        else:
+            interface = meshtastic.serial_interface.SerialInterface()
         init_node_data(interface)
         pub.subscribe(on_receive, "meshtastic.receive")
         
