@@ -15,8 +15,10 @@ import os
 logfile = 'daemon.log'
 
 # Configure Logging
+log_level = logging.DEBUG if os.environ.get('MESHTASTIC_DEBUG') == '1' else logging.INFO
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler(logfile, mode='w'),
@@ -24,6 +26,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('daemon')
+
+# Quiet down werkzeug (Flask's server logger) unless in debug mode
+if os.environ.get('MESHTASTIC_DEBUG') != '1':
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)

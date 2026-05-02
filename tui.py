@@ -17,7 +17,6 @@ class MeshTUI:
         curses.init_pair(2, curses.COLOR_CYAN, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_RED, -1)
-        
         self.state = {}
         self.messages = []
         self.neighbor_events = []
@@ -40,6 +39,7 @@ class MeshTUI:
         self.last_event_time = 0.0
         self.last_server_time = 0.0
         self.offline_mode = False
+        self.radio_offline = False
         self.running = True
 
     def fetch_data(self):
@@ -49,6 +49,7 @@ class MeshTUI:
                 r_state = requests.get(f"{API_URL}/api/state", timeout=2)
                 if r_state.status_code == 200:
                     self.offline_mode = False
+                    self.radio_offline = False
                     new_state = r_state.json()
                     
                     # Detect Daemon Restart
@@ -60,6 +61,9 @@ class MeshTUI:
                         self.neighbor_events = []
                     self.last_server_time = server_time
                     self.state = new_state
+                elif r_state.status_code == 500:
+                    self.offline_mode = False
+                    self.radio_offline = True
                 else:
                     self.offline_mode = True
                     
@@ -298,6 +302,8 @@ class MeshTUI:
         
         if self.offline_mode:
             self.safe_addstr(0, w - 20, " [ DAEMON OFFLINE ] ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
+        elif self.radio_offline:
+            self.safe_addstr(0, w - 20, " [ RADIO OFFLINE ]  ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
 
         self.draw_sidebar(h, mid_x, split1, split2, split3)
         self.draw_messages(h, w, mid_x)
