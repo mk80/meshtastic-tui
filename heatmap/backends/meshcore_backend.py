@@ -47,8 +47,31 @@ class MeshcoreBackend(RadioBackend):
             # Fetch full contact list
             try:
                 await self.mc.commands.get_contacts()
+                self._update_contacts(self.mc.contacts)
             except Exception as e:
                 logger.warning(f"Error fetching contacts: {e}")
+            
+            # Add local node to heatmap
+            info = self.mc.self_info
+            local_lat = info.get('adv_lat', 0.0)
+            local_lon = info.get('adv_lon', 0.0)
+            has_pos = local_lat != 0.0 or local_lon != 0.0
+            local_key = info.get('public_key', 'local')
+            with self.nodes_lock:
+                self.nodes_data[local_key] = {
+                    'id': local_key[:8] if isinstance(local_key, str) else 'local',
+                    'is_local': True,
+                    'name': info.get('name', 'Me'),
+                    'latitude': local_lat if has_pos else None,
+                    'longitude': local_lon if has_pos else None,
+                    'node_type': 'local',
+                    'sats': 0,
+                    'pdop': 0,
+                    'snr': 0,
+                    'rssi': 0,
+                    'source': 'live',
+                    'last_updated': time.time()
+                }
                 
             # Fetch channels dynamically
             await self._fetch_channels()
@@ -129,12 +152,23 @@ class MeshcoreBackend(RadioBackend):
     def _update_contacts(self, contacts_dict):
         with self.nodes_lock:
             for key, info in contacts_dict.items():
+                lat = info.get('adv_lat', 0)
+                lon = info.get('adv_lon', 0)
+                # Filter out 0,0 coords as "no position"
+                has_position = lat != 0.0 or lon != 0.0
+                
+                # MeshCore contact types: 0=NONE, 1=CLI(user), 2=REP(repeater), 3=ROOM, 4=SENS(sensor)
+                node_type_num = info.get('type', 1)
+                node_type_map = {0: 'unknown', 1: 'user', 2: 'repeater', 3: 'room', 4: 'sensor'}
+                node_type = node_type_map.get(node_type_num, 'unknown')
+                
                 self.nodes_data[key] = {
                     'id': key[:8] if isinstance(key, str) else str(key),
                     'is_local': False,
                     'name': info.get('adv_name', key),
-                    'latitude': info.get('lat'),
-                    'longitude': info.get('lon'),
+                    'latitude': lat if has_position else None,
+                    'longitude': lon if has_position else None,
+                    'node_type': node_type,
                     'sats': 0,
                     'pdop': 0,
                     'snr': info.get('snr', 0),

@@ -11,7 +11,7 @@ body, html {
 #map {
     width: 100vw;
     height: 100vh;
-    z-index: 1; /* Below overlay */
+    z-index: 1;
 }
 
 /* Glassmorphism Overlay */
@@ -76,12 +76,54 @@ body, html {
     display: block;
 }
 
-/* Local node specific style */
-.local-node-marker {
-    background: radial-gradient(circle, #00f2fe 0%, #4facfe 100%);
-    border: 2px solid white;
-    border-radius: 50%;
-    box-shadow: 0 0 10px #00f2fe;
+.popup-type {
+    font-size: 0.85rem;
+    color: #aaa;
+    margin-bottom: 6px;
+    display: inline-block;
+}
+
+/* Node marker styles */
+.node-marker {
+    background: transparent !important;
+    border: none !important;
+}
+
+.marker-icon {
+    font-size: 22px;
+    text-align: center;
+    line-height: 28px;
+    filter: drop-shadow(0 0 4px rgba(0, 0, 0, 0.8));
+}
+
+/* Local node */
+.local-node-marker .marker-icon {
+    font-size: 24px;
+    filter: drop-shadow(0 0 8px #00f2fe);
+}
+
+/* Repeater */
+.repeater-marker .marker-icon {
+    font-size: 22px;
+    filter: drop-shadow(0 0 6px #ff6b6b);
+}
+
+/* User */
+.user-marker .marker-icon {
+    font-size: 20px;
+    filter: drop-shadow(0 0 4px #4facfe);
+}
+
+/* Room server */
+.room-marker .marker-icon {
+    font-size: 20px;
+    filter: drop-shadow(0 0 5px #a78bfa);
+}
+
+/* Sensor */
+.sensor-marker .marker-icon {
+    font-size: 20px;
+    filter: drop-shadow(0 0 5px #34d399);
 }
 
 @keyframes fadeIn {
@@ -89,8 +131,8 @@ body, html {
     to { opacity: 1; transform: translateY(0); }
 }
 
-/* SNR Legend */
-#snr-legend {
+/* Node Legend */
+#node-legend {
     position: absolute;
     bottom: 32px;
     right: 20px;
@@ -103,7 +145,6 @@ body, html {
     padding: 16px 18px;
     color: #fff;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-    min-width: 160px;
     animation: fadeIn 0.5s ease-out;
 }
 
@@ -113,61 +154,13 @@ body, html {
     text-transform: uppercase;
     letter-spacing: 0.06em;
     color: #a0c4ff;
-    margin-bottom: 12px;
+    margin-bottom: 10px;
     text-align: center;
 }
 
-.legend-gradient-wrap {
+.legend-icons {
     display: flex;
-    flex-direction: row;
-    gap: 10px;
-    align-items: stretch;
-}
-
-.legend-gradient {
-    width: 18px;
-    height: 140px;
-    border-radius: 6px;
-    /* Top = strong (red), bottom = weak (blue) — matches JS heatmap gradient */
-    background: linear-gradient(
-        to bottom,
-        #ff0000,
-        #ffff00,
-        #00ff00,
-        #00ffff,
-        #0000ff
-    );
-    flex-shrink: 0;
-    box-shadow: 0 0 8px rgba(0, 242, 254, 0.2);
-}
-
-.legend-ticks {
-    display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-    height: 140px;
-    font-size: 0.72rem;
-    color: #cccccc;
-    line-height: 1;
-}
-
-.legend-ticks span {
-    white-space: nowrap;
-}
-
-.legend-labels {
-    display: flex;
-    justify-content: space-between;
-    margin-top: 8px;
-    font-size: 0.7rem;
-}
-
-.legend-label-strong {
-    color: #ff6b6b;
-    font-weight: 600;
-}
-
-.legend-label-weak {
-    color: #4facfe;
-    font-weight: 600;
+    gap: 16px;
+    font-size: 0.82rem;
+    color: #ccc;
 }
