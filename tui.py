@@ -21,7 +21,7 @@ class MeshTUI:
         self.messages = []
         self.neighbor_events = []
         self.active_channel = 0
-        self.channels = {0: "LongFast", 1: "Ch 1", 2: "Ch 2", 3: "Ch 3", 4: "Ch 4", 5: "Ch 5", 6: "Ch 6", 7: "Ch 7"}
+        self.channels = {0: "Channel 0"}
         self.dm_nodes = {}
         
         self.input_mode = False
@@ -31,11 +31,21 @@ class MeshTUI:
         self.config_buffers = ["", "", "", ""] # 4 fields now
         self.config_status = ""
         self.config_status_time = 0
+        
+        self.channel_manage_mode = False
+        self.channel_manage_idx = 0
+        self.channel_manage_state = 0 # 0=nav, 1=type, 2=name, 3=secret
+        self.channel_manage_type = 'public'
+        self.channel_input_text = ""
+        self.channel_secret_input = ""
+        
         self.config_saving = False
         self.unread_tabs = set()
         self.node_list = []
         self.node_mode = False
         self.node_idx = 0
+        self.node_filter = ""
+        self.filtered_nodes = []
         self.last_event_time = 0.0
         self.last_server_time = 0.0
         self.offline_mode = False
@@ -61,6 +71,12 @@ class MeshTUI:
                         self.neighbor_events = []
                     self.last_server_time = server_time
                     self.state = new_state
+                    
+                    if 'channels' in new_state:
+                        new_channels = {ch['index']: ch['name'] for ch in new_state['channels']}
+                        if new_channels:
+                            self.channels = new_channels
+                            
                 elif r_state.status_code == 500:
                     self.offline_mode = False
                     self.radio_offline = True
@@ -119,43 +135,87 @@ class MeshTUI:
         except curses.error:
             pass
 
-    def draw_sidebar(self, h, mid_x, split1, split2, split3):
+    def draw_sidebar(self, h, mid_x):
         # Radio Stats
         self.safe_addstr(0, 2, " Radio Stats ", curses.color_pair(1) | curses.A_BOLD)
         self.safe_addstr(2, 2, f"Device: {self.state.get('name', 'Unknown')}")
-        self.safe_addstr(3, 2, f"Local ID: {self.state.get('local_id', 'Unknown')}")
-        uptime = self.state.get('uptime', 0)
-        uptime_str = f"{uptime//3600:,}h {(uptime%3600)//60}m"
+        local_id_display = self.state.get('local_id', 'Unknown')
+        if len(local_id_display) > 10:
+            local_id_display = local_id_display[:8]
+        self.safe_addstr(3, 2, f"Local ID: {local_id_display}")
+        uptime = self.state.get('uptime')
+        uptime_str = f"{uptime//3600:,}h {(uptime%3600)//60}m" if uptime is not None else "N/A"
         self.safe_addstr(4, 2, f"Uptime: {uptime_str}")
-        batt_level = min(100, self.state.get('battery_level', 0))
-        self.safe_addstr(5, 2, f"Battery: {batt_level}% ({self.state.get('battery_voltage', 0.0)}V)")
-        self.safe_addstr(6, 2, f"ChUtil: {self.state.get('chutil', 0.0):.2f}%")
-        self.safe_addstr(7, 2, f"Nodes Online: {self.state.get('nodes_online', 0)}")
+        
+        batt_level = self.state.get('battery_level')
+        batt_v = self.state.get('battery_voltage')
+        if batt_level is not None and batt_v is not None:
+            batt_str = f"{min(100, batt_level)}% ({batt_v}V)"
+        elif batt_level is not None:
+            batt_str = f"{min(100, batt_level)}%"
+        else:
+            batt_str = "N/A"
+        self.safe_addstr(5, 2, f"Battery: {batt_str}")
+        
+        y_offset = 6
+        if 'chutil' in self.state:
+            self.safe_addstr(y_offset, 2, f"ChUtil: {self.state.get('chutil', 0.0):.2f}%")
+            y_offset += 1
+            
+        self.safe_addstr(y_offset, 2, f"Nodes Online: {self.state.get('nodes_online', 0)}")
+        
+        # Radio Settings
+        s_rs = 9
+        self.safe_addstr(s_rs, 2, " Radio Settings ", curses.color_pair(1) | curses.A_BOLD)
+        freq = self.state.get('radio_freq', 0.0)
+        bw = self.state.get('radio_bw', 0.0)
+        sf = self.state.get('radio_sf', 0)
+        cr = self.state.get('radio_cr', 0)
+        tx = self.state.get('tx_power', 0)
+        
+        self.safe_addstr(s_rs+2, 2, f"Freq: {freq} MHz")
+        self.safe_addstr(s_rs+3, 2, f"BW: {bw} kHz  SF: {sf}")
+        self.safe_addstr(s_rs+4, 2, f"CR: {cr}  TX Pwr: {tx} dBm")
         
         # GPS Status
-        self.safe_addstr(split1, 2, " GPS Status ", curses.color_pair(2) | curses.A_BOLD)
-        sats = self.state.get('sats', 0)
-        gps_live = self.state.get('gps_live', False)
-        color = curses.color_pair(1) if sats >= 3 else curses.color_pair(3)
-        self.safe_addstr(split1 + 2, 2, f"Sats In View: {sats}", color)
+        s_gps = 15
+        self.safe_addstr(s_gps, 2, " GPS Status ", curses.color_pair(2) | curses.A_BOLD)
+        sats = self.state.get('sats')
+        if sats is not None:
+            color = curses.color_pair(1) if sats >= 3 else curses.color_pair(3)
+            self.safe_addstr(s_gps + 2, 2, f"Sats In View: {sats}", color)
+        else:
+            color = curses.color_pair(3)
+            self.safe_addstr(s_gps + 2, 2, "Sats In View: N/A", color)
         
         lat = self.state.get('latitude', 0.0)
         lon = self.state.get('longitude', 0.0)
+        gps_live = self.state.get('gps_live', False)
         status_text = "Acquiring..." if lat == 0.0 else ("Locked" if gps_live else "Cached (awaiting live fix)")
-        self.safe_addstr(split1 + 3, 2, f"Lat: {lat:.5f}")
-        self.safe_addstr(split1 + 4, 2, f"Lon: {lon:.5f}")
-        pdop = self.state.get('pdop', 0) / 100.0
-        self.safe_addstr(split1 + 6, 2, f"Precision: {pdop:.2f}m")
-        self.safe_addstr(split1 + 7, 2, f"Status: {status_text}", color)
+        self.safe_addstr(s_gps + 3, 2, f"Lat: {lat:.5f}")
+        self.safe_addstr(s_gps + 4, 2, f"Lon: {lon:.5f}")
         
-        # Node Neighbors
-        self.safe_addstr(split2, 2, " Node Neighbors ", curses.color_pair(3) | curses.A_BOLD)
-        tel_y = split2 + 2
-        max_tel = split3 - split2 - 2
-        for t in self.neighbor_events[-max_tel:]:
-            sender = t.get('from', 'Unknown')
-            pos = t.get('pos', {})
-            line = f"{sender}: {pos.get('latitude', 0.0):.4f}, {pos.get('longitude', 0.0):.4f}"
+        pdop = self.state.get('pdop')
+        if pdop is not None:
+            self.safe_addstr(s_gps + 6, 2, f"Precision: {pdop / 100.0:.2f}m")
+        else:
+            self.safe_addstr(s_gps + 6, 2, "Precision: N/A")
+            
+        self.safe_addstr(s_gps + 7, 2, f"Status: {status_text}", color)
+        
+        # Recent Contacts
+        s_nn = 24
+        self.safe_addstr(s_nn, 2, " Recent Contacts ", curses.color_pair(3) | curses.A_BOLD)
+        tel_y = s_nn + 2
+        s_conf = h - 7
+        max_tel = s_conf - tel_y - 1
+        
+        contacts = sorted(self.node_list, key=lambda x: x.get('last_heard', 0), reverse=True)
+        for n in contacts[:max_tel]:
+            sender = n.get('long_name', n.get('id', 'Unknown'))
+            lh = n.get('last_heard', 0)
+            lh_str = f"{int(time.time() - lh)}s ago" if lh > 0 else "Never"
+            line = f"{sender[:15]}: {lh_str}"
             self.safe_addstr(tel_y, 2, line[:mid_x-4])
             tel_y += 1
             
@@ -169,11 +229,11 @@ class MeshTUI:
             status_line = f"[ {self.config_status} ]"
             status_color = curses.color_pair(2) | curses.A_BOLD
 
-        self.safe_addstr(split3, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
+        self.safe_addstr(s_conf, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
         if status_line:
-            self.safe_addstr(split3, mid_x - len(status_line) - 2, status_line, status_color)
+            self.safe_addstr(s_conf, mid_x - len(status_line) - 2, status_line, status_color)
             
-        conf_y = split3 + 1
+        conf_y = s_conf + 1
         fields = ["Long Name", "Short Name", "Hop Limit", "CLI Command"]
         for i, field in enumerate(fields):
             color = curses.color_pair(1) if (self.config_mode and self.config_idx == i) else 0
@@ -201,6 +261,10 @@ class MeshTUI:
 
         if self.node_mode:
             self.draw_node_selection(h, w, mid_x)
+            return
+            
+        if self.channel_manage_mode:
+            self.draw_channel_manager(h, w, mid_x)
             return
 
         local_id = self.state.get('local_id')
@@ -237,12 +301,23 @@ class MeshTUI:
 
     def draw_node_selection(self, h, w, mid_x):
         self.safe_addstr(2, mid_x + 2, "Discovery: SELECT NODE TO DM", curses.color_pair(3) | curses.A_BOLD)
-        self.safe_addstr(3, mid_x + 2, f"{'ID':<10} {'NAME':<15} {'SNR':<5} {'LAST HEARD':<10}")
+        if self.node_filter:
+            self.safe_addstr(2, w - max(20, len(self.node_filter) + 12), f" [Filter: {self.node_filter}] ", curses.color_pair(1) | curses.A_BOLD)
+            
+        self.safe_addstr(3, mid_x + 2, f"{'NAME':<20} {'SNR':<5} {'LAST HEARD':<10}")
         self.safe_addstr(4, mid_x + 2, "-" * (w - mid_x - 5))
         
+        self.filtered_nodes = []
+        for n in self.node_list:
+            if not self.node_filter or self.node_filter.lower() in n.get('long_name','').lower() or self.node_filter.lower() in n.get('short_name','').lower() or self.node_filter.lower() in n.get('id','').lower():
+                self.filtered_nodes.append(n)
+                
+        if self.node_idx >= len(self.filtered_nodes):
+            self.node_idx = max(0, len(self.filtered_nodes) - 1)
+            
         start_y = 5
         max_rows = h - 10
-        for i, node in enumerate(self.node_list[:max_rows]):
+        for i, node in enumerate(self.filtered_nodes[:max_rows]):
             attr = curses.A_REVERSE if i == self.node_idx else 0
             node_id = node.get('id', 'Unknown')
             name = node.get('long_name', node_id)
@@ -250,7 +325,7 @@ class MeshTUI:
             lh = node.get('last_heard', 0)
             lh_str = f"{int(time.time() - lh)}s ago" if lh > 0 else "Never"
             
-            line = f"{node_id:<10} {name[:15]:<15} {snr:<5} {lh_str:<10}"
+            line = f"{name[:20]:<20} {snr:<5} {lh_str:<10}"
             self.safe_addstr(start_y + i, mid_x + 2, line[:w-mid_x-5], attr)
 
     def draw_input(self, h, mid_x, w):
@@ -268,11 +343,11 @@ class MeshTUI:
             try: self.stdscr.move(h-3, mid_x + 2 + len(prompt) + len(display_text))
             except: pass
         elif self.node_mode:
-            self.safe_addstr(h-3, mid_x + 2, "[UP/DOWN arrows] [ENTER to DM] [L to cancel]", curses.color_pair(3))
+            self.safe_addstr(h-3, mid_x + 2, "Type to filter | [ESC to cancel] | [UP/DOWN] | [ENTER to DM]", curses.color_pair(3))
         else:
             curses.curs_set(0)
             available_w = w - mid_x - 4
-            help_text = "[ENTER to msg] [TAB ch/DM] [C config] [L find nodes]"
+            help_text = "[T]alk  [L]ocal Nodes  [C]onfig  [J]oin Channel  [Tab] Switch Channel  [Q]uit"
             self.safe_addstr(h-3, mid_x + 2, help_text[:available_w], curses.color_pair(3))
 
     def draw(self):
@@ -289,15 +364,19 @@ class MeshTUI:
             return
             
         mid_x = w // 2
-        split1, split2, split3 = h // 4, (h * 2) // 4, (h * 3) // 4
+        s_rs = 9
+        s_gps = 15
+        s_nn = 24
+        s_conf = h - 7
         
         # Borders and Frames
         try:
             self.stdscr.box()
             self.stdscr.vline(1, mid_x, curses.ACS_VLINE, h - 2)
-            self.stdscr.hline(split1, 1, curses.ACS_HLINE, mid_x - 1)
-            self.stdscr.hline(split2, 1, curses.ACS_HLINE, mid_x - 1)
-            self.stdscr.hline(split3, 1, curses.ACS_HLINE, mid_x - 1)
+            self.stdscr.hline(s_rs, 1, curses.ACS_HLINE, mid_x - 1)
+            self.stdscr.hline(s_gps, 1, curses.ACS_HLINE, mid_x - 1)
+            self.stdscr.hline(s_nn, 1, curses.ACS_HLINE, mid_x - 1)
+            self.stdscr.hline(s_conf, 1, curses.ACS_HLINE, mid_x - 1)
         except: pass
         
         if self.offline_mode:
@@ -305,10 +384,44 @@ class MeshTUI:
         elif self.radio_offline:
             self.safe_addstr(0, w - 20, " [ RADIO OFFLINE ]  ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
 
-        self.draw_sidebar(h, mid_x, split1, split2, split3)
+        self.draw_sidebar(h, mid_x)
         self.draw_messages(h, w, mid_x)
         self.draw_input(h, mid_x, w)
         self.stdscr.refresh()
+
+    def draw_channel_manager(self, h, w, mid_x):
+        title = " Manage Channels "
+        self.safe_addstr(0, mid_x + (w - mid_x)//2 - len(title)//2, title, curses.color_pair(2) | curses.A_BOLD)
+        
+        y_offset = 2
+        self.safe_addstr(y_offset, mid_x + 2, "Select a slot to edit (Enter) or clear (D/Del)")
+        y_offset += 2
+        
+        for i in range(8):
+            ch_name = self.channels.get(i, "[Empty]")
+            prefix = "-> " if i == self.channel_manage_idx else "   "
+            color = curses.color_pair(1) | curses.A_BOLD if i == self.channel_manage_idx else 0
+            
+            line = f"{prefix}Slot {i}: {ch_name}"
+            self.safe_addstr(y_offset, mid_x + 2, line, color)
+            
+            if i == self.channel_manage_idx and self.channel_manage_state > 0:
+                if self.channel_manage_state == 1:
+                    prompt = "Type: [P]ublic [H]ashtag p[R]ivate: "
+                    self.safe_addstr(y_offset + 1, mid_x + 6, prompt, curses.color_pair(3))
+                elif self.channel_manage_state == 2:
+                    prompt = "Hashtag Name: #" if self.channel_manage_type == 'hashtag' else "Channel Name: "
+                    self.safe_addstr(y_offset + 1, mid_x + 6, prompt, curses.color_pair(3))
+                    self.safe_addstr(y_offset + 1, mid_x + 6 + len(prompt), self.channel_input_text + "█", curses.color_pair(2))
+                elif self.channel_manage_state == 3:
+                    prompt = "Secret (32 hex chars): "
+                    self.safe_addstr(y_offset + 1, mid_x + 6, prompt, curses.color_pair(3))
+                    self.safe_addstr(y_offset + 1, mid_x + 6 + len(prompt), self.channel_secret_input + "█", curses.color_pair(2))
+                y_offset += 1 # shift down for input
+                
+            y_offset += 1
+            
+        self.stdscr.noutrefresh()
 
     def save_config_async(self, payload, idx):
         self.config_saving = True
@@ -347,7 +460,9 @@ class MeshTUI:
                             # Send message
                             if self.input_text.strip():
                                 payload = {"message": self.input_text.strip()}
-                                if not isinstance(self.active_channel, int):
+                                if isinstance(self.active_channel, int):
+                                    payload["channel"] = self.active_channel
+                                else:
                                     payload["destination"] = self.active_channel
                                     
                                 try:
@@ -401,20 +516,92 @@ class MeshTUI:
                             self.config_buffers[self.config_idx] = self.config_buffers[self.config_idx][:-1]
                         elif 32 <= c <= 126:
                             self.config_buffers[self.config_idx] += chr(c)
+                    elif self.channel_manage_mode:
+                        if self.channel_manage_state == 0:
+                            if c == 27: # ESC
+                                self.channel_manage_mode = False
+                            elif c == curses.KEY_UP:
+                                self.channel_manage_idx = max(0, self.channel_manage_idx - 1)
+                            elif c == curses.KEY_DOWN:
+                                self.channel_manage_idx = min(7, self.channel_manage_idx + 1)
+                            elif c in (10, 13): # ENTER
+                                self.channel_manage_state = 1 # Select type
+                            elif c in (ord('d'), ord('D'), curses.KEY_DC):
+                                payload = {"index": self.channel_manage_idx, "name": ""}
+                                try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
+                                except: pass
+                                self.channel_manage_mode = False
+                        elif self.channel_manage_state == 1:
+                            if c == 27: # ESC
+                                self.channel_manage_state = 0
+                            elif c in (ord('p'), ord('P')):
+                                payload = {"index": self.channel_manage_idx, "name": "Public", "type": "public"}
+                                try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
+                                except: pass
+                                self.channel_manage_mode = False
+                            elif c in (ord('h'), ord('H')):
+                                self.channel_manage_type = 'hashtag'
+                                self.channel_manage_state = 2
+                                self.channel_input_text = ""
+                            elif c in (ord('v'), ord('V'), ord('s'), ord('S'), ord('r'), ord('R')):
+                                self.channel_manage_type = 'private'
+                                self.channel_manage_state = 2
+                                self.channel_input_text = ""
+                        elif self.channel_manage_state == 2:
+                            if c == 27: # ESC
+                                self.channel_manage_state = 1
+                            elif c in (10, 13): # ENTER
+                                if self.channel_manage_type == 'hashtag':
+                                    payload = {
+                                        "index": self.channel_manage_idx, 
+                                        "name": self.channel_input_text.strip(),
+                                        "type": "hashtag"
+                                    }
+                                    try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
+                                    except: pass
+                                    self.channel_manage_mode = False
+                                else:
+                                    self.channel_manage_state = 3
+                                    self.channel_secret_input = ""
+                            elif c in (curses.KEY_BACKSPACE, 127, 8):
+                                self.channel_input_text = self.channel_input_text[:-1]
+                            elif 32 <= c <= 126:
+                                self.channel_input_text += chr(c)
+                        elif self.channel_manage_state == 3:
+                            if c == 27: # ESC
+                                self.channel_manage_state = 2
+                            elif c in (10, 13): # ENTER
+                                payload = {
+                                    "index": self.channel_manage_idx, 
+                                    "name": self.channel_input_text.strip(),
+                                    "type": "private",
+                                    "secret": self.channel_secret_input.strip()
+                                }
+                                try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
+                                except: pass
+                                self.channel_manage_mode = False
+                            elif c in (curses.KEY_BACKSPACE, 127, 8):
+                                self.channel_secret_input = self.channel_secret_input[:-1]
+                            elif 32 <= c <= 126:
+                                self.channel_secret_input += chr(c)
                     elif self.node_mode:
-                        if c == ord('l') or c == ord('L') or c == 27: # ESC
+                        if c == 27: # ESC
                             self.node_mode = False
                         elif c == curses.KEY_UP:
                             self.node_idx = max(0, self.node_idx - 1)
                         elif c == curses.KEY_DOWN:
-                            self.node_idx = min(len(self.node_list) - 1, self.node_idx + 1)
+                            self.node_idx = min(len(self.filtered_nodes) - 1, self.node_idx + 1)
                         elif c in (10, 13): # ENTER
-                            if self.node_list:
-                                target = self.node_list[self.node_idx]
+                            if self.filtered_nodes:
+                                target = self.filtered_nodes[self.node_idx]
                                 node_id = target.get('id')
                                 self.dm_nodes[node_id] = target.get('long_name', node_id)
                                 self.active_channel = node_id
                                 self.node_mode = False
+                        elif c in (curses.KEY_BACKSPACE, 127, 8):
+                            self.node_filter = self.node_filter[:-1]
+                        elif 32 <= c <= 126:
+                            self.node_filter += chr(c)
                     else:
                         if c == ord('q') or c == ord('Q'):
                             self.running = False
@@ -430,15 +617,24 @@ class MeshTUI:
                         elif c == ord('l') or c == ord('L'):
                             self.node_mode = True
                             self.node_idx = 0
-                        elif c == 9: # TAB
-                            # Cycle channels (0-7 standard) + DM nodes
+                        elif c in (ord('j'), ord('J')):
+                            self.channel_manage_mode = True
+                            self.channel_manage_idx = 0
+                            self.channel_input_mode = False
+                            self.channel_input_text = ""
+                            self.input_mode = False
+                            self.config_mode = False
+                            self.node_mode = False
+                        elif c in (9, curses.KEY_RIGHT, curses.KEY_LEFT): # TAB or ARROWS
+                            step = -1 if c == curses.KEY_LEFT else 1
+                            # Cycle channels (dynamic) + DM nodes
                             dm_list = list(self.dm_nodes.keys())
-                            tab_order = list(range(8)) + dm_list
+                            tab_order = list(self.channels.keys()) + dm_list
                             try:
                                 curr_idx = tab_order.index(self.active_channel)
-                                self.active_channel = tab_order[(curr_idx + 1) % len(tab_order)]
+                                self.active_channel = tab_order[(curr_idx + step) % len(tab_order)]
                             except ValueError:
-                                self.active_channel = 0
+                                self.active_channel = tab_order[0] if tab_order else 0
                             
                             if self.active_channel in self.unread_tabs:
                                 self.unread_tabs.remove(self.active_channel)

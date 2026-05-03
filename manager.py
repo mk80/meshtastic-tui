@@ -4,7 +4,7 @@ import subprocess
 import time
 import requests
 
-def start_daemon(debug=False):
+def start_daemon(debug=False, core='meshtastic'):
     # Only allow 1 to run
     try:
         if requests.get('http://localhost:5000/api/heatmap').status_code == 200:
@@ -51,6 +51,7 @@ def start_daemon(debug=False):
         env['MESHTASTIC_PORT'] = selected_port
     if debug:
         env['MESHTASTIC_DEBUG'] = '1'
+    env['RADIO_CORE'] = core
 
     # Use cwd to run the flask app correctly relative to its static folder
     proc = subprocess.Popen([sys.executable, 'app.py'], stdout=log, stderr=subprocess.STDOUT, cwd='heatmap', env=env)
@@ -111,7 +112,14 @@ if __name__ == '__main__':
     cmd = sys.argv[1].lower()
     if cmd == 'start':
         debug = '--debug' in sys.argv
-        start_daemon(debug=debug)
+        core = 'meshtastic'
+        if '--core' in sys.argv:
+            try:
+                idx = sys.argv.index('--core')
+                core = sys.argv[idx+1]
+            except IndexError:
+                pass
+        start_daemon(debug=debug, core=core)
     elif cmd == 'stop':
         stop_daemon()
     elif cmd == 'status':
