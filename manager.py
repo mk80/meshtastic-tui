@@ -7,26 +7,29 @@ import requests
 def start_daemon(debug=False, core='meshtastic'):
     # Only allow 1 to run
     try:
-        if requests.get('http://localhost:5000/api/heatmap').status_code == 200:
+        if requests.get('http://localhost:5000/api/state').status_code == 200:
             print("Daemon is already running!")
             return
     except requests.exceptions.ConnectionError:
         pass
 
-    try:
-        import meshtastic.util
-        ports = meshtastic.util.findPorts()
-        selected_port = None
+    selected_port = None
+    
+    if core.startswith('mock'):
+        print(f"Starting in {core} mode (no radio required).")
+    elif core == 'meshcore':
+        # Scan for serial devices commonly used by MeshCore
+        import glob
+        ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
         if len(ports) == 0:
-            print("Warning: No Meshtastic devices detected. The daemon will start but will wait for a device to be connected.")
+            print("Warning: No serial devices detected. The daemon will start but may fail to connect.")
         elif len(ports) == 1:
             print(f"Found Meshtastic device on port {ports[0]}.")
             selected_port = ports[0]
         else:
-            print("Multiple Meshtastic devices detected:")
+            print("Multiple serial devices detected:")
             for i, port in enumerate(ports):
                 print(f"  {i+1}: {port}")
-            
             while True:
                 choice = input(f"Select device to connect to (1-{len(ports)}): ")
                 try:
@@ -38,9 +41,34 @@ def start_daemon(debug=False, core='meshtastic'):
                         print(f"Please enter a number between 1 and {len(ports)}.")
                 except ValueError:
                     print("Invalid input. Please enter a number.")
-    except ImportError:
-        selected_port = None
-        print("Warning: Could not import meshtastic library to check ports.")
+    else:
+        # Meshtastic port detection
+        try:
+            import meshtastic.util
+            ports = meshtastic.util.findPorts()
+            if len(ports) == 0:
+                print("Warning: No Meshtastic devices detected. The daemon will start but will wait for a device to be connected.")
+            elif len(ports) == 1:
+                print(f"Found Meshtastic device on port {ports[0]}.")
+                selected_port = ports[0]
+            else:
+                print("Multiple Meshtastic devices detected:")
+                for i, port in enumerate(ports):
+                    print(f"  {i+1}: {port}")
+                while True:
+                    choice = input(f"Select device to connect to (1-{len(ports)}): ")
+                    try:
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(ports):
+                            selected_port = ports[idx]
+                            break
+                        else:
+                            print(f"Please enter a number between 1 and {len(ports)}.")
+                    except ValueError:
+                        print("Invalid input. Please enter a number.")
+        except ImportError:
+            selected_port = None
+            print("Warning: Could not import meshtastic library to check ports.")
 
     print("Starting background daemon...")
     # Run app.py in background, redirecting output to a log file
@@ -54,7 +82,7 @@ def start_daemon(debug=False, core='meshtastic'):
     env['RADIO_CORE'] = core
 
     # Use cwd to run the flask app correctly relative to its static folder
-    proc = subprocess.Popen([sys.executable, 'app.py'], stdout=log, stderr=subprocess.STDOUT, cwd='heatmap', env=env)
+    proc = subprocess.Popen([sys.executable, 'app.py'], stdout=log, stderr=subprocess.STDOUT, cwd='daemon', env=env)
     with open('.daemon.pid', 'w') as f:
         f.write(str(proc.pid))
     
@@ -63,7 +91,7 @@ def start_daemon(debug=False, core='meshtastic'):
     try:
         for _ in range(30):
             try:
-                response = requests.get('http://localhost:5000/api/heatmap')
+                response = requests.get('http://localhost:5000/api/state')
                 if response.status_code == 200:
                     print(f"\nDaemon successfully started (PID {proc.pid})!")
                     print("You can now securely run tui.py, send.py, or view http://localhost:5000 simultaneously.")
@@ -91,16 +119,19 @@ def stop_daemon():
     else:
         # Fallback check
         try:
-            requests.get('http://localhost:5000/api/heatmap')
+            requests.get('http://localhost:5000/api/state')
             print("A daemon is running, but no .daemon.pid found. You may need to manually 'kill' it.")
         except:
             print("No .daemon.pid file found, and daemon appears offline.")
 
 def show_status():
     try:
-        response = requests.get('http://localhost:5000/api/heatmap')
-        nodes = response.json()
-        print(f"Daemon is ONLINE. Tracking {len(nodes)} mapped nodes.")
+        r_state = requests.get('http://localhost:5000/api/state')
+        r_info = requests.get('http://localhost:5000/api/info')
+        state = r_state.json()
+        info = r_info.json()
+        core = info.get('core', 'unknown')
+        print(f"Daemon is ONLINE. Core: {core}. Tracking {state.get('nodes_online', 0)} nodes.")
     except Exception:
         print("Daemon is OFFLINE.")
 

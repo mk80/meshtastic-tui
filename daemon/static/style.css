@@ -164,3 +164,43 @@ body, html {
     font-size: 0.82rem;
     color: #ccc;
 }
+
+/* SNR Legend Gradient */
+#snr-legend {
+    position: absolute;
+    bottom: 32px;
+    right: 20px;
+    z-index: 1000;
+    background: rgba(25, 25, 30, 0.75);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 14px;
+    padding: 16px 18px;
+    color: #fff;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    min-width: 220px;
+}
+
+.legend-gradient {
+    margin-top: 8px;
+}
+
+.gradient-bar {
+    height: 10px;
+    width: 100%;
+    border-radius: 5px;
+    background: linear-gradient(90deg, 
+        rgba(255, 69, 0, 0.8) 0%, 
+        rgba(255, 215, 0, 0.8) 50%, 
+        rgba(0, 242, 254, 0.8) 100%
+    );
+    margin-bottom: 6px;
+}
+
+.gradient-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: #aaa;
+}

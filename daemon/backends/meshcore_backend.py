@@ -8,6 +8,8 @@ from .base import RadioBackend
 logger = logging.getLogger('daemon')
 
 class MeshcoreBackend(RadioBackend):
+    # MeshCore contact types: 0=NONE, 1=CLI(user), 2=REP(repeater), 3=ROOM, 4=SENS(sensor)
+    NODE_TYPE_MAP = {0: 'unknown', 1: 'user', 2: 'repeater', 3: 'room', 4: 'sensor'}
     def __init__(self, port=None):
         super().__init__(port)
         self.mc = None
@@ -159,8 +161,7 @@ class MeshcoreBackend(RadioBackend):
                 
                 # MeshCore contact types: 0=NONE, 1=CLI(user), 2=REP(repeater), 3=ROOM, 4=SENS(sensor)
                 node_type_num = info.get('type', 1)
-                node_type_map = {0: 'unknown', 1: 'user', 2: 'repeater', 3: 'room', 4: 'sensor'}
-                node_type = node_type_map.get(node_type_num, 'unknown')
+                node_type = self.NODE_TYPE_MAP.get(node_type_num, 'unknown')
                 
                 self.nodes_data[key] = {
                     'id': key[:8] if isinstance(key, str) else str(key),

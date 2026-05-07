@@ -58,3 +58,6 @@ cover/
 .DS_Store
 heatmap/messages.json
 heatmap/messages.json.tmp
+
+# private
+tuitest.key

@@ -138,6 +138,7 @@ class MeshtasticBackend(RadioBackend):
                             'name': user.get('longName', user.get('shortName', node_id)),
                             'latitude': pos.get('latitude'),
                             'longitude': pos.get('longitude'),
+                            'node_type': 'user',
                             'sats': pos.get('satsInView', 0),
                             'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
                             'snr': snr,
@@ -206,7 +207,7 @@ class MeshtasticBackend(RadioBackend):
                         'message': f"[TEXT MESSAGE] From: {name} -> {text}"
                     })
                 elif portnum == 'TELEMETRY_APP':
-                    telemetry = decoded.get('telemetry', {})
+                    telemetry = proto_to_dict(decoded.get('telemetry', {}))
                     self.add_event({
                         'type': 'telemetry',
                         'from': name,
@@ -215,7 +216,7 @@ class MeshtasticBackend(RadioBackend):
                         'message': f"[TELEMETRY] From: {name} -> {telemetry}"
                     })
                 elif portnum == 'NODEINFO_APP':
-                    user = decoded.get('user', {})
+                    user = proto_to_dict(decoded.get('user', {}))
                     self.add_event({
                         'type': 'nodeinfo',
                         'from': name,
@@ -225,7 +226,7 @@ class MeshtasticBackend(RadioBackend):
                     })
                 elif portnum == 'POSITION_APP':
                     raw_pos = decoded.get('position', {})
-                    pos = normalize_pos(raw_pos)
+                    pos = normalize_pos(proto_to_dict(raw_pos))
 
                     if not from_id:
                         logger.debug(f"Missing fromId in position packet: {pos}")
@@ -248,6 +249,7 @@ class MeshtasticBackend(RadioBackend):
                                     'name': name,
                                     'latitude': pos['latitude'],
                                     'longitude': pos['longitude'],
+                                    'node_type': 'user',
                                     'sats': pos.get('satsInView', 0),
                                     'pdop': pos.get('PDOP', pos.get('HDOP', 0)),
                                     'snr': rxSnr,
@@ -274,7 +276,7 @@ class MeshtasticBackend(RadioBackend):
         
         node_info = {}
         try:
-            node_info = self.interface.getMyNodeInfo() or {}
+            node_info = proto_to_dict(self.interface.getMyNodeInfo() or {})
         except:
             pass
 
@@ -297,8 +299,8 @@ class MeshtasticBackend(RadioBackend):
             if hasattr(self.interface.localNode, 'channels'):
                 for ch in self.interface.localNode.channels:
                     if ch.role != 0: # 0 is DISABLED
-                        name = ch.settings.name if ch.settings and ch.settings.name else f"Channel {ch.index}"
-                        channels.append({'index': ch.index, 'name': name})
+                        ch_name = ch.settings.name if ch.settings and ch.settings.name else f"Channel {ch.index}"
+                        channels.append({'index': ch.index, 'name': ch_name})
         except:
             pass
 
@@ -318,7 +320,7 @@ class MeshtasticBackend(RadioBackend):
             'long_name': user_info.get('longName', name),
             'short_name': user_info.get('shortName', "Unknown"),
             'hop_limit': getattr(lora_config, 'hop_limit', 3),
-            'radio_freq': 0.0, # Raw freq mapping is complex in Meshtastic, returning 0.0
+            'radio_freq': self._calculate_freq(lora_config),
             'radio_bw': getattr(lora_config, 'bandwidth', 0.0),
             'radio_sf': getattr(lora_config, 'spread_factor', 0),
             'radio_cr': getattr(lora_config, 'coding_rate', 0),
@@ -343,7 +345,9 @@ class MeshtasticBackend(RadioBackend):
                     'short_name': user.get('shortName', "??"),
                     'last_heard': info.get('lastHeard', 0),
                     'snr': live_data.get('snr', info.get('snr', -10)),
-                    'rssi': live_data.get('rssi', info.get('rssi', -100))
+                    'rssi': live_data.get('rssi', info.get('rssi', -100)),
+                    'latitude': live_data.get('latitude'),
+                    'longitude': live_data.get('longitude')
                 })
         
         nodes_list.sort(key=lambda x: x['last_heard'] or 0, reverse=True)
@@ -482,3 +486,13 @@ class MeshtasticBackend(RadioBackend):
         setattr(section, target_field, val)
         node.iface.localNode.writeConfig(section_name)
         return True
+
+    def _calculate_freq(self, lora_config):
+        try:
+            region = getattr(lora_config, 'region', 0)
+            # Rough mapping of Meshtastic regions to MHz
+            # 1: US, 2: EU433, 3: EU868, 4: CN, 5: JP, 6: ANZ, 7: KR, 8: TW, 9: RU
+            freqs = {1: 915.0, 2: 433.0, 3: 868.0, 4: 470.0, 5: 923.0, 6: 915.0, 7: 923.0, 8: 923.0, 9: 864.0}
+            return freqs.get(region, 0.0)
+        except:
+            return 0.0

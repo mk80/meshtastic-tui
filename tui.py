@@ -118,11 +118,18 @@ class MeshTUI:
                             self.messages.append(e)
                         elif e.get('type') == 'position':
                             self.neighbor_events.append(e)
+                            # Cap to prevent unbounded growth
+                            if len(self.neighbor_events) > 100:
+                                self.neighbor_events = self.neighbor_events[-100:]
                     
-                    # Fetch nodes
+                    # Fetch nodes and core info
                     r_nodes = requests.get(f"{API_URL}/api/nodes", timeout=2)
                     if r_nodes.status_code == 200:
                         self.node_list = r_nodes.json()
+                    
+                    r_info = requests.get(f"{API_URL}/api/info", timeout=2)
+                    if r_info.status_code == 200:
+                        self.state['core'] = r_info.json().get('core')
                 else:
                     self.offline_mode = True
             except Exception:
@@ -203,21 +210,32 @@ class MeshTUI:
             
         self.safe_addstr(s_gps + 7, 2, f"Status: {status_text}", color)
         
-        # Recent Contacts
+        # Node Neighbors / Recent Contacts
         s_nn = 24
-        self.safe_addstr(s_nn, 2, " Recent Contacts ", curses.color_pair(3) | curses.A_BOLD)
+        sidebar_title = " Node Neighbors " if self.state.get('core') == 'meshtastic' else " Recent Contacts "
+        self.safe_addstr(s_nn, 2, sidebar_title, curses.color_pair(3) | curses.A_BOLD)
         tel_y = s_nn + 2
         s_conf = h - 7
         max_tel = s_conf - tel_y - 1
         
-        contacts = sorted(self.node_list, key=lambda x: x.get('last_heard', 0), reverse=True)
-        for n in contacts[:max_tel]:
-            sender = n.get('long_name', n.get('id', 'Unknown'))
-            lh = n.get('last_heard', 0)
-            lh_str = f"{int(time.time() - lh)}s ago" if lh > 0 else "Never"
-            line = f"{sender[:15]}: {lh_str}"
-            self.safe_addstr(tel_y, 2, line[:mid_x-4])
-            tel_y += 1
+        if self.state.get('core') == 'meshtastic':
+            # Meshtastic: exactly as original — show last N received positions, most recent at bottom
+            for t in self.neighbor_events[-max_tel:]:
+                sender = t.get('from', 'Unknown')
+                pos = t.get('pos', {})
+                line = f"{sender}: {pos.get('latitude', 0.0):.4f}, {pos.get('longitude', 0.0):.4f}"
+                self.safe_addstr(tel_y, 2, line[:mid_x-4])
+                tel_y += 1
+        else:
+            # MeshCore: Show all contacts, sorted by last heard, with timestamps
+            contacts = sorted(self.node_list, key=lambda x: x.get('last_heard', 0), reverse=True)
+            for n in contacts[:max_tel]:
+                sender = n.get('long_name', n.get('id', 'Unknown'))
+                lh = n.get('last_heard', 0)
+                lh_str = f"{int(time.time() - lh)}s ago" if lh > 0 else "Never"
+                line = f"{sender[:15]}: {lh_str}"
+                self.safe_addstr(tel_y, 2, line[:mid_x-4])
+                tel_y += 1
             
         # Device Config
         status_line = ""
@@ -331,7 +349,15 @@ class MeshTUI:
     def draw_input(self, h, mid_x, w):
         self.stdscr.hline(h-4, mid_x + 1, curses.ACS_HLINE, w - mid_x - 2)
         if self.input_mode:
-            prompt = "Type message: "
+            # Find channel name
+            ch_name = f"Channel {self.active_channel}"
+            channels = self.state.get('channels', [])
+            for ch in channels:
+                if ch.get('index') == self.active_channel:
+                    ch_name = ch.get('name')
+                    break
+                    
+            prompt = f"[{ch_name}] > "
             available_w = w - mid_x - len(prompt) - 4
             # Scroll input if too long
             display_text = self.input_text
@@ -520,6 +546,9 @@ class MeshTUI:
                         if self.channel_manage_state == 0:
                             if c == 27: # ESC
                                 self.channel_manage_mode = False
+                                self.channel_manage_state = 0
+                                self.channel_input_text = ""
+                                self.channel_secret_input = ""
                             elif c == curses.KEY_UP:
                                 self.channel_manage_idx = max(0, self.channel_manage_idx - 1)
                             elif c == curses.KEY_DOWN:
@@ -531,6 +560,9 @@ class MeshTUI:
                                 try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
                                 except: pass
                                 self.channel_manage_mode = False
+                                self.channel_manage_state = 0
+                                self.channel_input_text = ""
+                                self.channel_secret_input = ""
                         elif self.channel_manage_state == 1:
                             if c == 27: # ESC
                                 self.channel_manage_state = 0
@@ -539,6 +571,9 @@ class MeshTUI:
                                 try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
                                 except: pass
                                 self.channel_manage_mode = False
+                                self.channel_manage_state = 0
+                                self.channel_input_text = ""
+                                self.channel_secret_input = ""
                             elif c in (ord('h'), ord('H')):
                                 self.channel_manage_type = 'hashtag'
                                 self.channel_manage_state = 2
@@ -560,6 +595,9 @@ class MeshTUI:
                                     try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
                                     except: pass
                                     self.channel_manage_mode = False
+                                    self.channel_manage_state = 0
+                                    self.channel_input_text = ""
+                                    self.channel_secret_input = ""
                                 else:
                                     self.channel_manage_state = 3
                                     self.channel_secret_input = ""
@@ -580,6 +618,9 @@ class MeshTUI:
                                 try: requests.post(f"{API_URL}/api/channel/set", json=payload, timeout=2)
                                 except: pass
                                 self.channel_manage_mode = False
+                                self.channel_manage_state = 0
+                                self.channel_input_text = ""
+                                self.channel_secret_input = ""
                             elif c in (curses.KEY_BACKSPACE, 127, 8):
                                 self.channel_secret_input = self.channel_secret_input[:-1]
                             elif 32 <= c <= 126:

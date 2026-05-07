@@ -3,26 +3,29 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MeshCore RF Heatmap</title>
+    <title>Node Map</title>
     <!-- Leaflet CSS -->
     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
     <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
     <div id="ui-overlay">
-        <h1>MeshCore Node Map</h1>
+        <h1>Node Map</h1>
         <div class="stats">
             <p>Nodes Mapped: <span id="node-count">0</span></p>
-            <p>🗼 Repeaters: <span id="repeater-count">0</span> &nbsp;|&nbsp; 👤 Users: <span id="user-count">0</span></p>
-            <p id="extra-counts" style="display:none; font-size: 0.95rem; color: #aaa;"></p>
+            <!-- MeshCore specific stats -->
+            <div id="meshcore-stats" style="display: none;">
+                <p>🗼 Repeaters: <span id="repeater-count">0</span> &nbsp;|&nbsp; 👤 Users: <span id="user-count">0</span></p>
+                <p id="extra-counts" style="font-size: 0.95rem; color: #aaa;"></p>
+            </div>
             <p>GPS Status: <span id="gps-status" style="color: #ffaa00;">Searching...</span></p>
-            <p class="subtitle">Live from your MeshCore Radio</p>
+            <p class="subtitle">Live from your Radio</p>
         </div>
     </div>
     <div id="map"></div>
 
-    <!-- Node Legend -->
-    <div id="node-legend">
+    <!-- MeshCore Legend -->
+    <div id="node-legend" style="display: none;">
         <div class="legend-title">Node Types</div>
         <div class="legend-icons">
             <span>📍 You</span>
@@ -33,8 +36,22 @@
         </div>
     </div>
 
+    <!-- Meshtastic Legend -->
+    <div id="snr-legend" style="display: none;">
+        <div class="legend-title">Signal Health (SNR)</div>
+        <div class="legend-gradient">
+            <div class="gradient-bar"></div>
+            <div class="gradient-labels">
+                <span>-10dB (Weak)</span>
+                <span>0dB</span>
+                <span>+10dB (Strong)</span>
+            </div>
+        </div>
+    </div>
+
     <!-- Leaflet JS -->
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
     <!-- App Logic -->
     <script src="/static/app.js"></script>
 </body>

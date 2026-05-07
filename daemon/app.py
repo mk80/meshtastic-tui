@@ -5,6 +5,7 @@ from flask_cors import CORS
 
 from backends.meshtastic_backend import MeshtasticBackend
 from backends.meshcore_backend import MeshcoreBackend
+from backends.mock_backend import MockMeshtasticBackend, MockMeshcoreBackend
 
 log_level = logging.DEBUG if os.environ.get('MESHTASTIC_DEBUG') == '1' else logging.INFO
 
@@ -24,15 +25,24 @@ app = Flask(__name__, static_folder='static', static_url_path='/static')
 CORS(app)
 
 backend = None
+radio_core = 'meshtastic'
 
 def init_backend():
-    global backend
-    core = os.environ.get('RADIO_CORE', 'meshtastic').lower()
+    global backend, radio_core
+    radio_core = os.environ.get('RADIO_CORE', 'meshtastic').lower()
     port = os.environ.get('MESHTASTIC_PORT')
     
-    if core == 'meshcore':
+    if radio_core == 'meshcore':
         logger.info("Initializing MeshCore backend...")
         backend = MeshcoreBackend(port=port)
+    elif radio_core == 'mock-meshtastic':
+        logger.info("Initializing Mock Meshtastic backend...")
+        backend = MockMeshtasticBackend(port=port)
+        radio_core = 'meshtastic'  # Report as meshtastic to the frontend
+    elif radio_core == 'mock-meshcore':
+        logger.info("Initializing Mock MeshCore backend...")
+        backend = MockMeshcoreBackend(port=port)
+        radio_core = 'meshcore'  # Report as meshcore to the frontend
     else:
         logger.info("Initializing Meshtastic backend...")
         backend = MeshtasticBackend(port=port)
@@ -42,6 +52,10 @@ def init_backend():
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
+
+@app.route('/api/info')
+def api_info():
+    return jsonify({'core': radio_core})
 
 @app.route('/api/heatmap')
 def api_heatmap():
