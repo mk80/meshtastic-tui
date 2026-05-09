@@ -903,11 +903,10 @@ class MeshTUI:
 
         # Cursor on text fields
         if cur_field in ('name', 'psk'):
+            row_idx = ['role', 'name', 'psk', 'uplink_enabled', 'downlink_enabled'].index(cur_field)
+            label_len = len(cur_field) + 2  # "<name>: "
             try:
-                pos_y = y + 2 + ('name' if cur_field == 'name' else 'psk' and 2 or 0)
-                row_idx = ['role','name','psk','uplink_enabled','downlink_enabled'].index(cur_field)
-                lbl_len = len(cur_field) + 2
-                self.stdscr.move(y + 2 + row_idx, x + lbl_len + len(b[cur_field]))
+                self.stdscr.move(y + 2 + row_idx, x + label_len + len(b[cur_field]))
                 curses.curs_set(1)
             except curses.error:
                 pass
