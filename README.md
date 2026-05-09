@@ -126,5 +126,22 @@ python manager.py status
 
 ---
 
+## 🔒 Security Model
+
+The daemon listens on `0.0.0.0:5000` so any device on your LAN can view the heatmap. Only two routes are exposed to the LAN:
+
+- `GET /` — the heatmap UI
+- `GET /api/heatmap` — the node data the map renders
+
+Everything else (`/api/send`, `/api/config/apply`, `/api/state`, `/api/stream`, `/api/nodes`) is **loopback-only** and rejects non-`127.0.0.1` peers with `403`. That means:
+
+- A browser on your LAN can see the map but cannot transmit on your radio or change its config.
+- The TUI must run on the same machine as the daemon — SSH into the host and launch `tui.py` there. `send.py` likewise.
+- A malicious page in any browser on your LAN cannot reach the command endpoints.
+
+If you ever want to expose the heatmap beyond your LAN (e.g. via a tunnel), reverse-proxy only `/` and `/api/heatmap`, not the whole port.
+
+---
+
 ## 🌱 Future Enhancements (Roadmap)
 - **Breadcrumb Trails**: Currently handles raw snapshots. Future support for local SQLite/JSON caching will allow saving actual driving loops and graphing dense historical RF shadow zones over time!
