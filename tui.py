@@ -89,6 +89,19 @@ class MeshTUI:
                         self.neighbor_events = []
                     self.last_server_time = server_time
                     self.state = new_state
+                    # Update tab labels from radio's actual channel names.
+                    for ch in new_state.get('channels') or []:
+                        idx = ch.get('index')
+                        name = (ch.get('name') or '').strip()
+                        role = ch.get('role', 'DISABLED')
+                        if isinstance(idx, int) and 0 <= idx < 8:
+                            if name and role != 'DISABLED':
+                                self.channels[idx] = name
+                            elif role == 'DISABLED':
+                                # Distinguish a disabled slot in the cycle
+                                self.channels[idx] = f"Ch {idx} (off)"
+                            else:
+                                self.channels[idx] = f"Ch {idx}"
                 elif r_state.status_code == 500:
                     self.offline_mode = False
                     self.radio_offline = True
@@ -316,11 +329,6 @@ class MeshTUI:
             self.stdscr.hline(split2, 1, curses.ACS_HLINE, mid_x - 1)
         except: pass
         
-        if self.offline_mode:
-            self.safe_addstr(0, w - 20, " [ DAEMON OFFLINE ] ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
-        elif self.radio_offline:
-            self.safe_addstr(0, w - 20, " [ RADIO OFFLINE ]  ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
-
         self.draw_sidebar(h, mid_x, split1, split2)
         if self.settings_mode:
             self.draw_settings(h, w, mid_x)
@@ -329,6 +337,21 @@ class MeshTUI:
         else:
             self.draw_messages(h, w, mid_x)
         self.draw_input(h, mid_x, w)
+
+        # Offline / reconnect banner overlays the right-pane header so the user
+        # can't miss it. Reverse video instead of blink — many terminals don't
+        # render A_BLINK (and it's visually noisy where they do).
+        banner = None
+        if self.offline_mode:
+            banner = "  DAEMON OFFLINE — start it with: python manager.py start  "
+        elif self.radio_offline:
+            banner = "  RADIO OFFLINE — daemon reconnecting (config writes can trigger a reboot, ~30s)  "
+        if banner:
+            pane_x = mid_x + 2
+            pane_w = max(1, w - mid_x - 4)
+            banner = banner[:pane_w]
+            self.safe_addstr(0, pane_x, banner,
+                             curses.color_pair(4) | curses.A_BOLD | curses.A_REVERSE)
         self.stdscr.refresh()
 
     # ----- Settings mode (full config) -----
@@ -364,7 +387,7 @@ class MeshTUI:
                               json={'section': section_key, 'fields': {field_name: value}},
                               timeout=15)
             if r.status_code == 200:
-                self.settings_status = "Saved!"
+                self.settings_status = "Saved (radio may reboot)"
                 # Patch the local cache so the field list reflects the new value immediately.
                 fields = self._current_section_data()
                 for f in fields:
@@ -900,6 +923,15 @@ class MeshTUI:
             attr = curses.A_REVERSE if key == cur_field else 0
             label = "" if key.startswith('__') else f"{key}: "
             self.safe_addstr(y + 2 + i, x, (label + disp)[:w], attr)
+
+        # Contextual hint for the focused field
+        hint = None
+        if cur_field == 'psk':
+            hint = "blank=keep current, none, default, random, simple0-9, or hex"
+        elif cur_field == 'role':
+            hint = "PRIMARY (default channel) / SECONDARY (extra) / DISABLED (off)"
+        if hint:
+            self.safe_addstr(y + 2 + len(rows) + 1, x, hint[:w], curses.color_pair(3))
 
         # Cursor on text fields
         if cur_field in ('name', 'psk'):

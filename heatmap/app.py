@@ -463,6 +463,20 @@ def api_state():
     except:
         pass
 
+    # Surface channel names so the TUI's tab cycle shows real names, not "Ch N".
+    # Use whatever's already cached — don't request from the radio here, the
+    # state endpoint is polled often.
+    channels = []
+    try:
+        for ch in (interface.localNode.channels or []):
+            channels.append({
+                'index': ch.index,
+                'name':  ch.settings.name or '',
+                'role':  CHANNEL_ROLE_NAMES.get(ch.role, str(ch.role)),
+            })
+    except Exception:
+        pass
+
     state = {
         'nodes_online': len(nodes_data),
         'local_id': local_id,
@@ -479,6 +493,7 @@ def api_state():
         'long_name': user_info.get('longName', name),
         'short_name': user_info.get('shortName', "Unknown"),
         'hop_limit': getattr(lora_config, 'hop_limit', 3), # Expose hop limit
+        'channels': channels,
         'server_time': time.time()
     }
     return jsonify(state)
