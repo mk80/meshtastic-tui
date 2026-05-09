@@ -1,7 +1,7 @@
 import logging
 import time
 import threading
-from collections import deque
+import sqlite3
 from flask import Flask, jsonify, send_from_directory, request, abort
 from functools import wraps
 import meshtastic
@@ -48,34 +48,73 @@ def local_only(f):
 
 nodes_data = {}
 nodes_lock = threading.Lock()
-events = deque(maxlen=10) # User requested 10 recent messages limit
-events_lock = threading.Lock()
-MESSAGES_FILE = 'messages.json'
 interface = None
 
-def save_events():
-    try:
-        tmp_file = MESSAGES_FILE + ".tmp"
-        with events_lock:
-            data = [e for e in events if e.get('type') == 'text']
-        with open(tmp_file, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp_file, MESSAGES_FILE)
-    except Exception as e:
-        logger.error(f"Error saving messages: {e}")
+# Message/event persistence: a SQLite store keyed by event time. The full event
+# JSON is stored in `payload` and replayed verbatim by /api/stream and /api/history,
+# while the indexed columns let us answer per-channel and DM backfill queries fast.
+MESSAGES_DB = 'messages.db'
+MESSAGES_FILE = 'messages.json'  # legacy; migrated on first start with new code
+db_lock = threading.Lock()
+db_conn = None
+STREAM_LIMIT = 500
+HISTORY_LIMIT = 500
 
-def load_events():
-    if not os.path.exists(MESSAGES_FILE):
-        return
-    try:
-        with open(MESSAGES_FILE, 'r') as f:
-            saved = json.load(f)
-            with events_lock:
-                events.clear()
-                events.extend(saved)
-            logger.info(f"Loaded {len(events)} (out of {len(saved)} on disk) messages into recent history.")
-    except Exception as e:
-        logger.error(f"Error loading messages: {e}")
+def init_db():
+    global db_conn
+    db_conn = sqlite3.connect(MESSAGES_DB, check_same_thread=False)
+    db_conn.row_factory = sqlite3.Row
+    db_conn.execute("PRAGMA journal_mode=WAL")
+    db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            time      REAL    NOT NULL,
+            type      TEXT    NOT NULL,
+            from_id   TEXT,
+            to_id     TEXT,
+            from_name TEXT,
+            channel   INTEGER,
+            text      TEXT,
+            hop_limit INTEGER,
+            payload   TEXT    NOT NULL
+        )
+    """)
+    db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
+    db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_channel_time ON events(channel, time)")
+    db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dm_time ON events(from_id, to_id, time)")
+    db_conn.commit()
+
+    # One-time migration from the legacy messages.json.
+    if os.path.exists(MESSAGES_FILE):
+        try:
+            existing = db_conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            with open(MESSAGES_FILE) as f:
+                old = json.load(f)
+            if existing == 0 and old:
+                logger.info(f"Migrating {len(old)} events from {MESSAGES_FILE} into {MESSAGES_DB}")
+                for e in old:
+                    _insert_event_row(e)
+            os.rename(MESSAGES_FILE, MESSAGES_FILE + '.bak')
+            logger.info(f"Renamed {MESSAGES_FILE} to {MESSAGES_FILE}.bak")
+        except Exception as ex:
+            logger.warning(f"Legacy messages.json migration skipped: {ex}")
+
+def _insert_event_row(event):
+    db_conn.execute(
+        "INSERT INTO events (time, type, from_id, to_id, from_name, channel, text, hop_limit, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.get('time', time.time()),
+            event.get('type', 'unknown'),
+            event.get('fromId'),
+            event.get('toId'),
+            event.get('from'),
+            event.get('channel'),
+            event.get('text'),
+            event.get('hopLimit'),
+            json.dumps(event),
+        ),
+    )
 
 def get_local_node_id():
     """Robustly fetch the local node's ID from the interface."""
@@ -137,14 +176,16 @@ def normalize_pos(pos):
 
 def add_event(msg_or_dict):
     if isinstance(msg_or_dict, dict):
-        clean_dict = proto_to_dict(msg_or_dict)
-        clean_dict['time'] = time.time()
-        with events_lock:
-            events.append(clean_dict)
+        event = proto_to_dict(msg_or_dict)
+        event['time'] = time.time()
     else:
-        with events_lock:
-            events.append({'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'})
-    save_events()
+        event = {'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'}
+    try:
+        with db_lock:
+            _insert_event_row(event)
+            db_conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to persist event: {e}")
 
 def init_node_data(interface):
     local_id = get_local_node_id()
@@ -351,9 +392,44 @@ def api_heatmap():
 @local_only
 def api_stream():
     since = request.args.get('since', 0, type=float)
-    with events_lock:
-        new_events = [e for e in events if e.get('time', 0.0) > since]
-    return jsonify(new_events)
+    with db_lock:
+        rows = db_conn.execute(
+            "SELECT payload FROM events WHERE time > ? ORDER BY time LIMIT ?",
+            (since, STREAM_LIMIT),
+        ).fetchall()
+    return jsonify([json.loads(r['payload']) for r in rows])
+
+@app.route('/api/history')
+@local_only
+def api_history():
+    """Backfill text history for a channel or DM thread, oldest-first."""
+    channel = request.args.get('channel', type=int)
+    dm = request.args.get('dm')
+    before = request.args.get('before', type=float, default=time.time())
+    limit = min(request.args.get('limit', 100, type=int), HISTORY_LIMIT)
+
+    with db_lock:
+        if channel is not None:
+            rows = db_conn.execute(
+                "SELECT payload FROM events "
+                "WHERE type='text' AND channel=? AND time<? "
+                "  AND (to_id IS NULL OR to_id IN ('^all','^local','!ffffffff')) "
+                "ORDER BY time DESC LIMIT ?",
+                (channel, before, limit),
+            ).fetchall()
+        elif dm:
+            local_id = get_local_node_id() or ''
+            rows = db_conn.execute(
+                "SELECT payload FROM events "
+                "WHERE type='text' AND time<? "
+                "  AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?)) "
+                "ORDER BY time DESC LIMIT ?",
+                (before, dm, local_id, local_id, dm, limit),
+            ).fetchall()
+        else:
+            return jsonify({'error': 'channel or dm parameter required'}), 400
+
+    return jsonify([json.loads(r['payload']) for r in reversed(rows)])
 
 @app.route('/api/state')
 @local_only
@@ -596,7 +672,7 @@ def api_send():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    load_events()
+    init_db()
     connect_radio()
     logger.info("Daemon starting on 0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
