@@ -540,9 +540,154 @@ def api_config_apply():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+LOCAL_CONFIG_SECTIONS = ('device', 'position', 'power', 'network', 'display',
+                        'lora', 'bluetooth', 'security')
+MODULE_CONFIG_SECTIONS = ('mqtt', 'serial', 'external_notification', 'store_forward',
+                         'range_test', 'telemetry', 'canned_message', 'audio',
+                         'remote_hardware', 'neighbor_info', 'ambient_lighting',
+                         'detection_sensor', 'paxcounter')
+
+# Wire-type integer → friendly name. Mirrors google.protobuf.descriptor.FieldDescriptor.TYPE_*.
+PROTO_TYPE_NAMES = {
+    1: 'double', 2: 'float', 3: 'int64', 4: 'uint64',
+    5: 'int32', 6: 'fixed64', 7: 'fixed32', 8: 'bool',
+    9: 'string', 10: 'group', 11: 'message', 12: 'bytes',
+    13: 'uint32', 14: 'enum', 15: 'sfixed32', 16: 'sfixed64',
+    17: 'sint32', 18: 'sint64',
+}
+
+def _config_section_map(node):
+    """Section name → protobuf section message, covering localConfig + moduleConfig."""
+    sections = {}
+    for name in LOCAL_CONFIG_SECTIONS:
+        if hasattr(node.localConfig, name):
+            sections[name] = getattr(node.localConfig, name)
+    for name in MODULE_CONFIG_SECTIONS:
+        if hasattr(node.moduleConfig, name):
+            sections[name] = getattr(node.moduleConfig, name)
+    return sections
+
+def _ensure_section_loaded(node, section_msg, section_name):
+    """If the local cache for this section is empty, ask the radio for it."""
+    try:
+        if len(section_msg.ListFields()) > 0:
+            return
+        field_desc = node.localConfig.DESCRIPTOR.fields_by_name.get(section_name) \
+                  or node.moduleConfig.DESCRIPTOR.fields_by_name.get(section_name)
+        if field_desc:
+            logger.info(f"Section {section_name} cache empty; requesting from radio")
+            node.requestConfig(field_desc)
+            time.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"requestConfig({section_name}) failed: {e}")
+
+def describe_section(section_msg):
+    """Walk a section message's descriptor and emit typed field info + current values."""
+    out = []
+    for fd in section_msg.DESCRIPTOR.fields:
+        type_name = PROTO_TYPE_NAMES.get(fd.type, 'unknown')
+        try:
+            value = getattr(section_msg, fd.name)
+        except AttributeError:
+            value = None
+
+        info = {'name': fd.name, 'type': type_name}
+        is_repeated = getattr(fd, 'is_repeated', False) or getattr(fd, 'label', None) == 3
+        if is_repeated:
+            info['type'] = 'repeated_' + type_name
+            info['value'] = list(value) if value else []
+        elif fd.type == fd.TYPE_ENUM:
+            info['enum_values'] = [v.name for v in fd.enum_type.values]
+            try:
+                info['value'] = fd.enum_type.values_by_number[value].name
+            except (KeyError, TypeError):
+                info['value'] = value
+        elif fd.type == fd.TYPE_BYTES:
+            info['value'] = value.hex() if value else ''
+        elif fd.type == fd.TYPE_MESSAGE:
+            # Nested messages (e.g. position.fixed_position struct) are not editable
+            # generically; surface as opaque so the TUI can show them read-only.
+            info['type'] = 'message'
+            info['skipped'] = True
+            info['value'] = None
+        else:
+            info['value'] = value
+        out.append(info)
+    return out
+
+@app.route('/api/config', methods=['GET'])
+@local_only
+def api_config_get():
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+    out = {'localConfig': {}, 'moduleConfig': {}, 'user': []}
+    sections = _config_section_map(node)
+    for name, msg in sections.items():
+        _ensure_section_loaded(node, msg, name)
+        bucket = 'localConfig' if name in LOCAL_CONFIG_SECTIONS else 'moduleConfig'
+        out[bucket][name] = describe_section(msg)
+    try:
+        user = (interface.getMyNodeInfo() or {}).get('user', {})
+        out['user'] = [
+            {'name': 'long_name',       'type': 'string', 'value': user.get('longName', '')},
+            {'name': 'short_name',      'type': 'string', 'value': user.get('shortName', '')},
+            {'name': 'is_licensed',     'type': 'bool',   'value': bool(user.get('isLicensed', False))},
+            {'name': 'is_unmessagable', 'type': 'bool',   'value': bool(user.get('isUnmessagable', False))},
+        ]
+    except Exception:
+        pass
+    return jsonify(out)
+
+@app.route('/api/config', methods=['POST'])
+@local_only
+def api_config_post():
+    """Apply a batch of field changes to one config section, atomically when supported."""
+    data = request.json or {}
+    section = data.get('section')
+    fields = data.get('fields') or {}
+    if not section or not isinstance(fields, dict):
+        return jsonify({'error': 'body must be {"section": "...", "fields": {...}}'}), 400
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+
+    try:
+        if section == 'user':
+            kwargs = {k: fields[k] for k in ('long_name', 'short_name', 'is_licensed', 'is_unmessagable')
+                      if k in fields}
+            if not kwargs:
+                return jsonify({'error': 'no recognized user fields'}), 400
+            node.setOwner(**kwargs)
+            return jsonify({'status': 'ok'})
+
+        if section not in _config_section_map(node):
+            return jsonify({'error': f'unknown section: {section}'}), 400
+
+        in_tx = False
+        try:
+            node.beginSettingsTransaction()
+            in_tx = True
+        except Exception as e:
+            logger.warning(f"beginSettingsTransaction unavailable: {e}")
+
+        try:
+            for fname, val in fields.items():
+                set_pref(node, f"{section}.{fname}", val)
+        finally:
+            if in_tx:
+                try:
+                    node.commitSettingsTransaction()
+                except Exception as e:
+                    logger.warning(f"commitSettingsTransaction failed: {e}")
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"config write failed for section={section}: {e}")
+        return jsonify({'error': str(e)}), 500
+
 def set_pref(node, key, val):
     import meshtastic.util
-    
+
     # Preferred way: use library helper if available
     try:
         if hasattr(node, 'set_simple_preference'):
@@ -553,27 +698,7 @@ def set_pref(node, key, val):
         logger.warning(f"set_simple_preference failed for {key}: {e}")
 
     # Fallback: Manual protobuf manipulation
-    section_map = {
-        'device': node.localConfig.device,
-        'lora': node.localConfig.lora,
-        'network': node.localConfig.network,
-        'display': node.localConfig.display,
-        'position': node.localConfig.position,
-        'power': node.localConfig.power,
-        'security': node.localConfig.security,
-        'telemetry': node.moduleConfig.telemetry,
-        'mqtt': node.moduleConfig.mqtt,
-        'serial': node.moduleConfig.serial,
-        'external_notification': node.moduleConfig.external_notification,
-        'store_forward': node.moduleConfig.store_forward,
-        'range_test': node.moduleConfig.range_test,
-        'canned_message': node.moduleConfig.canned_message,
-        'audio': node.moduleConfig.audio,
-        'remote_hardware': node.moduleConfig.remote_hardware,
-        'neighbor_info': node.moduleConfig.neighbor_info,
-        'ambient_lighting': node.moduleConfig.ambient_lighting,
-        'paxcounter': node.moduleConfig.paxcounter,
-    }
+    section_map = _config_section_map(node)
 
     if '.' not in key:
         raise ValueError("Key must be 'section.parameter'")
@@ -583,21 +708,7 @@ def set_pref(node, key, val):
         raise ValueError(f"Unknown section: {section_name}")
     
     section = section_map[section_name]
-    
-    # CLI sync logic: Request config if we don't have its fields yet
-    try:
-        if len(section.ListFields()) == 0:
-            logger.info(f"Section {section_name} is empty, requesting from radio...")
-            field_desc = node.localConfig.DESCRIPTOR.fields_by_name.get(section_name)
-            if not field_desc:
-                field_desc = node.moduleConfig.DESCRIPTOR.fields_by_name.get(section_name)
-            
-            if field_desc:
-                node.requestConfig(field_desc)
-                # Short wait for response
-                time.sleep(0.5)
-    except Exception as e:
-        logger.warning(f"Failed to requestConfig for {section_name}: {e}")
+    _ensure_section_loaded(node, section, section_name)
 
     field_name_snake = meshtastic.util.camel_to_snake(field_name)
     
