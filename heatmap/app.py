@@ -2,8 +2,8 @@ import logging
 import time
 import threading
 from collections import deque
-from flask import Flask, jsonify, send_from_directory, request
-from flask_cors import CORS
+from flask import Flask, jsonify, send_from_directory, request, abort
+from functools import wraps
 import meshtastic
 import meshtastic.serial_interface
 from pubsub import pub
@@ -32,10 +32,20 @@ if os.environ.get('MESHTASTIC_DEBUG') != '1':
     logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
-CORS(app)
 
 # Global constants and state
 BROADCAST_ADDRS = ('^all', '^local', '!ffffffff')
+LOCAL_ADDRS = frozenset({'127.0.0.1', '::1', '::ffff:127.0.0.1'})
+
+def local_only(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if request.remote_addr not in LOCAL_ADDRS:
+            abort(403)
+        return f(*args, **kwargs)
+    return wrapper
+
+
 nodes_data = {}
 nodes_lock = threading.Lock()
 events = deque(maxlen=10) # User requested 10 recent messages limit
@@ -338,6 +348,7 @@ def api_heatmap():
     return jsonify(data)
 
 @app.route('/api/stream')
+@local_only
 def api_stream():
     since = request.args.get('since', 0, type=float)
     with events_lock:
@@ -345,6 +356,7 @@ def api_stream():
     return jsonify(new_events)
 
 @app.route('/api/state')
+@local_only
 def api_state():
     if not interface:
         return jsonify({'error': 'Not connected'}), 500
@@ -396,6 +408,7 @@ def api_state():
     return jsonify(state)
 
 @app.route('/api/nodes', methods=['GET'])
+@local_only
 def api_nodes():
     if not interface or not interface.nodes:
         return jsonify([])
@@ -421,6 +434,7 @@ def api_nodes():
     return jsonify(nodes_list)
 
 @app.route('/api/config/apply', methods=['POST'])
+@local_only
 def api_config_apply():
     data = request.json
     if not interface or not interface.localNode:
@@ -551,6 +565,7 @@ def set_pref(node, key, val):
     return True
 
 @app.route('/api/send', methods=['POST'])
+@local_only
 def api_send():
     data = request.json
     if not interface:

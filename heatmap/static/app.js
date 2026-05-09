@@ -8,7 +8,6 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 20
 }).addTo(map);
 
-let heatLayer = null;
 let markersLayer = L.layerGroup().addTo(map);
 
 // Save map position on user interactions to persist zoom
@@ -34,16 +33,31 @@ if (savedPos) {
 // Keep track of active markers so we don't destroy open popups on autorefresh
 const activeMarkers = {};
 
-// Helper to calculate heat intensity based on SNR
-// Typical LoRa SNR is -20 (terrible) to +10 (excellent)
+// Helper to calculate heat intensity based on SNR.
+// Range tuned to real-world Meshtastic reception, not theoretical LoRa limits:
+// -22 dB is the practical decode floor; -10 dB is a strong direct neighbor.
+// A passing/co-located radio that exceeds -10 dB just clamps to red.
 function getHeatIntensity(snr) {
-    // Normalize SNR to a 0.0 - 1.0 range based on -20 to 10 limits
-    let minSnr = -20;
-    let maxSnr = 10;
+    let minSnr = -22;
+    let maxSnr = -10;
     let intensity = (snr - minSnr) / (maxSnr - minSnr);
-    // Clamp between 0 and 1
     return Math.max(0, Math.min(1, intensity));
 }
+
+// HSL hue 240 (blue) → 0 (red), matching the legend gradient stops.
+function snrToColor(snr) {
+    const hue = 240 - getHeatIntensity(snr) * 240;
+    return `hsl(${hue}, 100%, 55%)`;
+}
+
+// Dedicated pane for the SNR glow blobs so we can blur them
+// without affecting tiles, markers, or popups.
+map.createPane('snrGlow');
+map.getPane('snrGlow').style.filter = 'blur(18px)';
+map.getPane('snrGlow').style.zIndex = '405';
+map.getPane('snrGlow').style.pointerEvents = 'none';
+
+const snrBlobs = {};
 
 async function fetchHeatmapData() {
     try {
@@ -52,8 +66,6 @@ async function fetchHeatmapData() {
         
         document.getElementById('node-count').innerText = nodes.length;
 
-        // Arrays for heat layer and bounding box
-        const heatPoints = [];
         const latLngs = [];
 
         let localGpsLocked = false;
@@ -70,13 +82,6 @@ async function fetchHeatmapData() {
             }
 
             if (node.latitude && node.longitude) {
-                // Determine heat level
-                const intensity = getHeatIntensity(node.snr);
-                
-                // Add to heat layer (exclude local node from skewing its own heatmap)
-                if (!node.is_local) {
-                    heatPoints.push([node.latitude, node.longitude, intensity]);
-                }
                 latLngs.push([node.latitude, node.longitude]);
 
                 const locKey = node.latitude.toFixed(6) + "," + node.longitude.toFixed(6);
@@ -92,6 +97,39 @@ async function fetchHeatmapData() {
                 if (node.is_local) {
                     groupedNodes[locKey].has_local = true;
                 }
+            }
+        });
+
+        // Render one SNR-colored, CSS-blurred blob per location group.
+        // Color is the strongest SNR among co-located nodes — the "best path here."
+        // Done as plain circles in a blurred pane (not leaflet.heat) so neighboring
+        // nodes don't sum into false hotspots; each node's SNR is honest.
+        const newBlobKeys = new Set();
+        Object.entries(groupedNodes).forEach(([locKey, group]) => {
+            if (group.has_local) return;
+            newBlobKeys.add(locKey);
+            const maxSnr = Math.max(...group.nodes.map(n => n.snr));
+            const color = snrToColor(maxSnr);
+            const radius = 22 + Math.min(group.nodes.length - 1, 4) * 3;
+
+            if (snrBlobs[locKey]) {
+                snrBlobs[locKey].setStyle({fillColor: color});
+                snrBlobs[locKey].setRadius(radius);
+            } else {
+                snrBlobs[locKey] = L.circleMarker([group.latitude, group.longitude], {
+                    radius: radius,
+                    fillColor: color,
+                    fillOpacity: 0.75,
+                    weight: 0,
+                    pane: 'snrGlow',
+                    interactive: false
+                }).addTo(map);
+            }
+        });
+        Object.keys(snrBlobs).forEach(k => {
+            if (!newBlobKeys.has(k)) {
+                map.removeLayer(snrBlobs[k]);
+                delete snrBlobs[k];
             }
         });
 
@@ -138,14 +176,14 @@ async function fetchHeatmapData() {
                     });
                     circle = L.marker([group.latitude, group.longitude], {icon: icon});
                 } else {
-                    // Add an invisible circle marker for hovering tooltips for standard nodes
+                    // Invisible circle marker — exists to host the popup; the heat layer carries the SNR signal.
                     circle = L.circleMarker([group.latitude, group.longitude], {
-                        radius: 12 + (group.nodes.length * 2), // dynamically size interaction area based on density
+                        radius: 12 + (group.nodes.length * 2),
                         color: 'transparent',
                         fillColor: 'transparent'
                     });
                 }
-                
+
                 circle.bindPopup(popupContent, { maxHeight: 300 });
                 circle.addTo(markersLayer);
                 activeMarkers[locKey] = circle;
@@ -160,30 +198,10 @@ async function fetchHeatmapData() {
             }
         });
 
-        // Update the heatmap layer
-        if (heatLayer) {
-            map.removeLayer(heatLayer);
-        }
-        
-        if (heatPoints.length > 0) {
-            heatLayer = L.heatLayer(heatPoints, {
-                radius: 35,
-                blur: 25,
-                maxZoom: 14,
-                gradient: {
-                    0.2: 'blue', 
-                    0.4: 'cyan', 
-                    0.6: 'lime', 
-                    0.8: 'yellow', 
-                    1.0: 'red'
-                }
-            }).addTo(map);
-
-            if (firstLoad) {
-                // Fit bounds to show all data gracefully
-                map.fitBounds(L.latLngBounds(latLngs), { padding: [50, 50], maxZoom: 12 });
-                firstLoad = false;
-            }
+        if (latLngs.length > 0 && firstLoad) {
+            // Fit bounds to show all data gracefully on first load
+            map.fitBounds(L.latLngBounds(latLngs), { padding: [50, 50], maxZoom: 12 });
+            firstLoad = false;
         }
 
         if (!localGpsLocked) {
