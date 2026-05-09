@@ -44,6 +44,22 @@ class MeshTUI:
         self.settings_status_time = 0.0
         self.settings_saving = False
 
+        # Channels mode (key C). Views: 'list' | 'edit' | 'share' | 'import'.
+        self.channels_mode = False
+        self.channels_view = 'list'
+        self.channels_loading = False
+        self.channels_data = []          # list of channel dicts from /api/channels
+        self.channels_idx = 0            # selected channel in list view
+        self.channels_edit_field_idx = 0 # which row in edit form is focused
+        self.channels_edit_buffers = {}  # mutated values during edit
+        self.channels_share_url = ''
+        self.channels_share_qr = []      # list of pre-rendered QR rows
+        self.channels_import_buffer = ''
+        self.channels_import_mode = 'replace'  # or 'add'
+        self.channels_status = ''
+        self.channels_status_time = 0.0
+        self.channels_saving = False
+
         self.unread_tabs = set()
         self.node_list = []
         self.node_mode = False
@@ -259,10 +275,21 @@ class MeshTUI:
             else:
                 hint = "[ENTER] save  [ESC] cancel"
             self.safe_addstr(h-3, mid_x + 2, hint[:available_w], curses.color_pair(3))
+        elif self.channels_mode:
+            available_w = w - mid_x - 4
+            if self.channels_view == 'list':
+                hint = "[↑↓] select  [ENTER] edit  [U] share  [I] import  [ESC] exit"
+            elif self.channels_view == 'edit':
+                hint = "[↑↓] field  [←→/SPACE] toggle/cycle  [ENTER on Save/Delete]  [ESC] cancel"
+            elif self.channels_view == 'share':
+                hint = "[ESC] back"
+            else:
+                hint = "[type] URL  [M] toggle mode  [ENTER] import  [ESC] cancel"
+            self.safe_addstr(h-3, mid_x + 2, hint[:available_w], curses.color_pair(3))
         else:
             curses.curs_set(0)
             available_w = w - mid_x - 4
-            help_text = "[ENTER to msg] [TAB ch/DM] [C settings] [L find nodes] [Q quit]"
+            help_text = "[ENTER msg] [TAB ch/DM] [C channels] [O options] [L find nodes] [Q quit]"
             self.safe_addstr(h-3, mid_x + 2, help_text[:available_w], curses.color_pair(3))
 
     def draw(self):
@@ -297,6 +324,8 @@ class MeshTUI:
         self.draw_sidebar(h, mid_x, split1, split2)
         if self.settings_mode:
             self.draw_settings(h, w, mid_x)
+        elif self.channels_mode:
+            self.draw_channels(h, w, mid_x)
         else:
             self.draw_messages(h, w, mid_x)
         self.draw_input(h, mid_x, w)
@@ -646,6 +675,369 @@ class MeshTUI:
             elif 32 <= c <= 126:
                 self.settings_edit_buffer += chr(c)
 
+    # ----- Channels mode -----
+
+    CHANNEL_ROLES = ['DISABLED', 'PRIMARY', 'SECONDARY']
+    CHANNEL_EDIT_ROWS = ['role', 'name', 'psk', 'uplink_enabled',
+                         'downlink_enabled', '__save__', '__delete__']
+
+    def _channels_set_status(self, msg):
+        self.channels_status = msg
+        self.channels_status_time = time.time()
+
+    def fetch_channels_async(self):
+        self.channels_loading = True
+        try:
+            r = requests.get(f"{API_URL}/api/channels", timeout=15)
+            if r.status_code == 200:
+                self.channels_data = r.json().get('channels', [])
+                if self.channels_idx >= len(self.channels_data):
+                    self.channels_idx = 0
+            else:
+                self._channels_set_status(f"Load error {r.status_code}")
+        except Exception as e:
+            self._channels_set_status(f"Load error: {str(e)[:24]}")
+        self.channels_loading = False
+
+    def save_channel_async(self, payload):
+        self.channels_saving = True
+        self._channels_set_status("Saving...")
+        try:
+            r = requests.post(f"{API_URL}/api/channels", json=payload, timeout=15)
+            if r.status_code == 200:
+                self._channels_set_status("Saved!")
+                # Refresh list after a successful write
+                self.fetch_channels_async()
+            else:
+                err = ''
+                try: err = r.json().get('error', '')
+                except Exception: err = r.text[:40]
+                self._channels_set_status(f"Err: {err[:24]}")
+        except Exception as e:
+            self._channels_set_status(f"Err: {str(e)[:24]}")
+        self.channels_saving = False
+
+    def delete_channel_async(self, idx):
+        self.channels_saving = True
+        self._channels_set_status("Deleting...")
+        try:
+            r = requests.delete(f"{API_URL}/api/channels/{idx}", timeout=10)
+            if r.status_code == 200:
+                self._channels_set_status("Deleted")
+                self.fetch_channels_async()
+            else:
+                self._channels_set_status(f"Err: {r.status_code}")
+        except Exception as e:
+            self._channels_set_status(f"Err: {str(e)[:24]}")
+        self.channels_saving = False
+
+    def fetch_share_url_async(self):
+        self.channels_loading = True
+        self.channels_share_url = ''
+        self.channels_share_qr = []
+        try:
+            r = requests.get(f"{API_URL}/api/channels/url", timeout=10)
+            if r.status_code == 200:
+                url = r.json().get('url', '')
+                self.channels_share_url = url
+                self.channels_share_qr = self._render_qr_ascii(url)
+            else:
+                self._channels_set_status(f"URL load err {r.status_code}")
+        except Exception as e:
+            self._channels_set_status(f"URL err: {str(e)[:24]}")
+        self.channels_loading = False
+
+    def import_channel_url_async(self, url, mode):
+        self.channels_saving = True
+        self._channels_set_status("Importing...")
+        try:
+            r = requests.post(f"{API_URL}/api/channels/import",
+                              json={'url': url, 'mode': mode}, timeout=15)
+            if r.status_code == 200:
+                self._channels_set_status("Imported")
+                self.fetch_channels_async()
+            else:
+                err = ''
+                try: err = r.json().get('error', '')
+                except Exception: err = r.text[:40]
+                self._channels_set_status(f"Err: {err[:24]}")
+        except Exception as e:
+            self._channels_set_status(f"Err: {str(e)[:24]}")
+        self.channels_saving = False
+
+    @staticmethod
+    def _render_qr_ascii(text):
+        try:
+            import qrcode
+        except ImportError:
+            return ['(install "qrcode" for QR rendering)']
+        qr = qrcode.QRCode(border=1, box_size=1)
+        qr.add_data(text)
+        qr.make(fit=True)
+        m = qr.modules
+        out = []
+        for y in range(0, len(m), 2):
+            row = []
+            for x in range(len(m[0])):
+                top = m[y][x]
+                bot = m[y + 1][x] if y + 1 < len(m) else False
+                row.append('█' if top and bot else ('▀' if top else ('▄' if bot else ' ')))
+            out.append(''.join(row))
+        return out
+
+    def _enter_channel_edit(self):
+        if not self.channels_data:
+            return
+        ch = self.channels_data[self.channels_idx]
+        self.channels_edit_buffers = {
+            'role':              ch.get('role', 'DISABLED'),
+            'name':              ch.get('name', ''),
+            'psk':               '',  # blank means "leave PSK unchanged"
+            'uplink_enabled':    bool(ch.get('uplink_enabled', False)),
+            'downlink_enabled':  bool(ch.get('downlink_enabled', False)),
+        }
+        self.channels_edit_field_idx = 0
+        self.channels_view = 'edit'
+
+    def _submit_channel_edit(self):
+        if not self.channels_data:
+            return
+        ch = self.channels_data[self.channels_idx]
+        b = self.channels_edit_buffers
+        payload = {
+            'index':            ch['index'],
+            'role':             b['role'],
+            'name':             b['name'],
+            'uplink_enabled':   bool(b['uplink_enabled']),
+            'downlink_enabled': bool(b['downlink_enabled']),
+        }
+        if b['psk'].strip():
+            payload['psk'] = b['psk'].strip()
+        threading.Thread(target=self.save_channel_async, args=(payload,), daemon=True).start()
+        self.channels_view = 'list'
+        curses.curs_set(0)
+
+    def _delete_current_channel(self):
+        if not self.channels_data:
+            return
+        idx = self.channels_data[self.channels_idx]['index']
+        threading.Thread(target=self.delete_channel_async, args=(idx,), daemon=True).start()
+        self.channels_view = 'list'
+        curses.curs_set(0)
+
+    def draw_channels(self, h, w, mid_x):
+        # Header
+        if self.channels_view == 'list':
+            header = " Channels — list "
+        elif self.channels_view == 'edit' and self.channels_data:
+            ch = self.channels_data[self.channels_idx]
+            header = f" Channels — edit #{ch['index']} "
+        elif self.channels_view == 'share':
+            header = " Channels — share "
+        elif self.channels_view == 'import':
+            header = " Channels — import URL "
+        else:
+            header = " Channels "
+        self.safe_addstr(0, mid_x + 2, header[:w - mid_x - 4],
+                         curses.color_pair(2) | curses.A_BOLD)
+
+        # Status indicator
+        if self.channels_saving:
+            tag = " SAVING "
+            self.safe_addstr(0, w - len(tag) - 2, tag, curses.color_pair(3) | curses.A_BOLD)
+        elif self.channels_status and time.time() - self.channels_status_time < 3:
+            tag = f" {self.channels_status[:20]} "
+            color = curses.color_pair(4) if self.channels_status.startswith('Err') else curses.color_pair(1)
+            self.safe_addstr(0, w - len(tag) - 2, tag, color | curses.A_BOLD)
+
+        if self.channels_loading and self.channels_view in ('list', 'share'):
+            self.safe_addstr(h // 2, mid_x + 4, "Loading…", curses.color_pair(3))
+            return
+
+        pane_x = mid_x + 2
+        pane_top = 2
+        pane_h = max(1, h - 5 - pane_top)
+        pane_w = max(1, w - mid_x - 4)
+
+        if self.channels_view == 'list':
+            self._draw_channels_list(pane_x, pane_top, pane_w, pane_h)
+        elif self.channels_view == 'edit':
+            self._draw_channels_edit(pane_x, pane_top, pane_w, pane_h)
+        elif self.channels_view == 'share':
+            self._draw_channels_share(pane_x, pane_top, pane_w, pane_h)
+        elif self.channels_view == 'import':
+            self._draw_channels_import(pane_x, pane_top, pane_w, pane_h)
+
+    def _draw_channels_list(self, x, y, w, h):
+        if not self.channels_data:
+            self.safe_addstr(y, x, "(no channels — radio not loaded)")
+            return
+        self.safe_addstr(y, x, f"{'#':<3} {'role':<10} {'name':<14} psk", curses.color_pair(3))
+        for offs, ch in enumerate(self.channels_data[:h - 1]):
+            attr = curses.A_REVERSE if offs == self.channels_idx else 0
+            line = f"{ch['index']:<3} {ch.get('role','?')[:10]:<10} {(ch.get('name','') or '—')[:14]:<14} {ch.get('psk_kind','?')}"
+            self.safe_addstr(y + 1 + offs, x, line[:w], attr)
+
+    def _draw_channels_edit(self, x, y, w, h):
+        if not self.channels_data:
+            return
+        ch = self.channels_data[self.channels_idx]
+        b = self.channels_edit_buffers
+        self.safe_addstr(y, x, f"Editing channel #{ch['index']}",
+                         curses.color_pair(3) | curses.A_BOLD)
+
+        rows = []
+        rows.append(('role',              f"< {b['role']} >"))
+        rows.append(('name',              b['name']))
+        rows.append(('psk',               b['psk'] or "(unchanged)"))
+        rows.append(('uplink_enabled',    '[true]' if b['uplink_enabled'] else '[false]'))
+        rows.append(('downlink_enabled',  '[true]' if b['downlink_enabled'] else '[false]'))
+        rows.append(('__save__',          '[ Save ]'))
+        rows.append(('__delete__',        '[ Delete channel ]'))
+
+        cur_field = self.CHANNEL_EDIT_ROWS[self.channels_edit_field_idx]
+        for i, (key, disp) in enumerate(rows):
+            attr = curses.A_REVERSE if key == cur_field else 0
+            label = "" if key.startswith('__') else f"{key}: "
+            self.safe_addstr(y + 2 + i, x, (label + disp)[:w], attr)
+
+        # Cursor on text fields
+        if cur_field in ('name', 'psk'):
+            try:
+                pos_y = y + 2 + ('name' if cur_field == 'name' else 'psk' and 2 or 0)
+                row_idx = ['role','name','psk','uplink_enabled','downlink_enabled'].index(cur_field)
+                lbl_len = len(cur_field) + 2
+                self.stdscr.move(y + 2 + row_idx, x + lbl_len + len(b[cur_field]))
+                curses.curs_set(1)
+            except curses.error:
+                pass
+        else:
+            curses.curs_set(0)
+
+    def _draw_channels_share(self, x, y, w, h):
+        url = self.channels_share_url or '(no URL)'
+        self.safe_addstr(y, x, "Shareable URL:", curses.color_pair(3) | curses.A_BOLD)
+        # Wrap URL across lines for the narrow pane
+        cur_y = y + 1
+        for i in range(0, len(url), w):
+            self.safe_addstr(cur_y, x, url[i:i+w])
+            cur_y += 1
+        cur_y += 1
+        if self.channels_share_qr:
+            self.safe_addstr(cur_y, x, "Scan QR:", curses.color_pair(3) | curses.A_BOLD)
+            cur_y += 1
+            for line in self.channels_share_qr:
+                if cur_y >= y + h:
+                    break
+                self.safe_addstr(cur_y, x, line[:w])
+                cur_y += 1
+
+    def _draw_channels_import(self, x, y, w, h):
+        self.safe_addstr(y, x, "Paste a meshtastic.org/e/# URL to import.",
+                         curses.color_pair(3))
+        mode_disp = f"< {self.channels_import_mode} >"
+        self.safe_addstr(y + 2, x, f"Mode: {mode_disp}    [M] toggle replace/add",
+                         curses.color_pair(2))
+        self.safe_addstr(y + 4, x, "URL: " + self.channels_import_buffer,
+                         curses.color_pair(1) | curses.A_BOLD)
+        try:
+            self.stdscr.move(y + 4, x + 5 + len(self.channels_import_buffer))
+            curses.curs_set(1)
+        except curses.error:
+            pass
+
+    def handle_channels_key(self, c):
+        if self.channels_loading and self.channels_view in ('list', 'share'):
+            if c == 27:
+                self.channels_mode = False
+            return
+
+        if self.channels_view == 'list':
+            n = len(self.channels_data)
+            if c == 27:
+                self.channels_mode = False
+            elif c == curses.KEY_UP:
+                self.channels_idx = max(0, self.channels_idx - 1)
+            elif c == curses.KEY_DOWN:
+                self.channels_idx = min(max(0, n - 1), self.channels_idx + 1)
+            elif c in (curses.KEY_ENTER, 10, 13) and n > 0:
+                self._enter_channel_edit()
+            elif c in (ord('u'), ord('U')):
+                self.channels_view = 'share'
+                threading.Thread(target=self.fetch_share_url_async, daemon=True).start()
+            elif c in (ord('i'), ord('I')):
+                self.channels_view = 'import'
+                self.channels_import_buffer = ''
+                self.channels_import_mode = 'replace'
+            return
+
+        if self.channels_view == 'edit':
+            if c == 27:
+                self.channels_view = 'list'
+                curses.curs_set(0)
+                return
+            n = len(self.CHANNEL_EDIT_ROWS)
+            cur = self.CHANNEL_EDIT_ROWS[self.channels_edit_field_idx]
+
+            if c == curses.KEY_UP:
+                self.channels_edit_field_idx = max(0, self.channels_edit_field_idx - 1)
+                return
+            if c == curses.KEY_DOWN:
+                self.channels_edit_field_idx = min(n - 1, self.channels_edit_field_idx + 1)
+                return
+
+            b = self.channels_edit_buffers
+            if cur == 'role':
+                if c == curses.KEY_LEFT:
+                    i = self.CHANNEL_ROLES.index(b['role'])
+                    b['role'] = self.CHANNEL_ROLES[(i - 1) % len(self.CHANNEL_ROLES)]
+                elif c == curses.KEY_RIGHT:
+                    i = self.CHANNEL_ROLES.index(b['role'])
+                    b['role'] = self.CHANNEL_ROLES[(i + 1) % len(self.CHANNEL_ROLES)]
+            elif cur in ('uplink_enabled', 'downlink_enabled'):
+                if c in (curses.KEY_LEFT, curses.KEY_RIGHT, 32):
+                    b[cur] = not b[cur]
+            elif cur in ('name', 'psk'):
+                if c in (curses.KEY_BACKSPACE, 127, 8):
+                    b[cur] = b[cur][:-1]
+                elif 32 <= c <= 126:
+                    b[cur] += chr(c)
+            elif cur == '__save__':
+                if c in (curses.KEY_ENTER, 10, 13):
+                    self._submit_channel_edit()
+            elif cur == '__delete__':
+                if c in (curses.KEY_ENTER, 10, 13):
+                    self._delete_current_channel()
+            return
+
+        if self.channels_view == 'share':
+            if c == 27:
+                self.channels_view = 'list'
+            return
+
+        if self.channels_view == 'import':
+            if c == 27:
+                self.channels_view = 'list'
+                curses.curs_set(0)
+                return
+            if c in (ord('m'), ord('M')) and not self.channels_import_buffer:
+                # Allow toggling mode only when buffer is empty so it doesn't conflict with typing
+                self.channels_import_mode = 'add' if self.channels_import_mode == 'replace' else 'replace'
+                return
+            if c in (curses.KEY_ENTER, 10, 13):
+                if self.channels_import_buffer.strip():
+                    threading.Thread(target=self.import_channel_url_async,
+                                     args=(self.channels_import_buffer.strip(),
+                                           self.channels_import_mode),
+                                     daemon=True).start()
+                    self.channels_view = 'list'
+                    curses.curs_set(0)
+                return
+            if c in (curses.KEY_BACKSPACE, 127, 8):
+                self.channels_import_buffer = self.channels_import_buffer[:-1]
+            elif 32 <= c <= 126:
+                self.channels_import_buffer += chr(c)
+
     def run(self):
         self.stdscr.nodelay(True)
         self.stdscr.timeout(500)
@@ -694,6 +1086,8 @@ class MeshTUI:
                             self.input_text += chr(c)
                     elif self.settings_mode:
                         self.handle_settings_key(c)
+                    elif self.channels_mode:
+                        self.handle_channels_key(c)
                     elif self.node_mode:
                         if c == ord('l') or c == ord('L') or c == 27: # ESC
                             self.node_mode = False
@@ -711,12 +1105,18 @@ class MeshTUI:
                     else:
                         if c == ord('q') or c == ord('Q'):
                             self.running = False
-                        elif c == ord('c') or c == ord('C'):
+                        elif c == ord('o') or c == ord('O'):
                             self.settings_mode = True
                             self.settings_view = 'sections'
                             self.settings_section_idx = 0
                             self.settings_field_idx = 0
                             threading.Thread(target=self.fetch_settings_async,
+                                             daemon=True).start()
+                        elif c == ord('c') or c == ord('C'):
+                            self.channels_mode = True
+                            self.channels_view = 'list'
+                            self.channels_idx = 0
+                            threading.Thread(target=self.fetch_channels_async,
                                              daemon=True).start()
                         elif c == ord('l') or c == ord('L'):
                             self.node_mode = True
