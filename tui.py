@@ -90,18 +90,20 @@ class MeshTUI:
                     self.last_server_time = server_time
                     self.state = new_state
                     # Update tab labels from radio's actual channel names.
+                    # The Meshtastic primary channel often has an empty name field
+                    # (the modem-preset default — e.g. "LongFast"), so don't
+                    # overwrite the existing label when name is blank.
                     for ch in new_state.get('channels') or []:
                         idx = ch.get('index')
                         name = (ch.get('name') or '').strip()
                         role = ch.get('role', 'DISABLED')
-                        if isinstance(idx, int) and 0 <= idx < 8:
-                            if name and role != 'DISABLED':
-                                self.channels[idx] = name
-                            elif role == 'DISABLED':
-                                # Distinguish a disabled slot in the cycle
-                                self.channels[idx] = f"Ch {idx} (off)"
-                            else:
-                                self.channels[idx] = f"Ch {idx}"
+                        if not isinstance(idx, int) or not (0 <= idx < 8):
+                            continue
+                        if role == 'DISABLED':
+                            self.channels[idx] = f"Ch {idx} (off)"
+                        elif name:
+                            self.channels[idx] = name
+                        # else: leave the existing label (preserves "LongFast" for primary)
                 elif r_state.status_code == 500:
                     self.offline_mode = False
                     self.radio_offline = True
@@ -319,7 +321,11 @@ class MeshTUI:
             return
             
         mid_x = w // 2
-        split1, split2 = h // 3, (h * 2) // 3
+        # Fixed-size sidebar panes: Radio Stats and GPS each render ~8 rows of
+        # static content. Lock those to 8 each and let Node Neighbors absorb
+        # the remaining vertical space.
+        split1 = 8
+        split2 = 16
 
         # Borders and Frames
         try:
@@ -387,7 +393,7 @@ class MeshTUI:
                               json={'section': section_key, 'fields': {field_name: value}},
                               timeout=15)
             if r.status_code == 200:
-                self.settings_status = "Saved (radio may reboot)"
+                self.settings_status = "Saved — may reboot"
                 # Patch the local cache so the field list reflects the new value immediately.
                 fields = self._current_section_data()
                 for f in fields:
@@ -467,7 +473,7 @@ class MeshTUI:
             tag = " SAVING "
             self.safe_addstr(0, w - len(tag) - 2, tag, curses.color_pair(3) | curses.A_BOLD)
         elif self.settings_status and time.time() - self.settings_status_time < 3:
-            tag = f" {self.settings_status[:20]} "
+            tag = f" {self.settings_status[:32]} "
             color = curses.color_pair(4) if self.settings_status.startswith('Err') else curses.color_pair(1)
             self.safe_addstr(0, w - len(tag) - 2, tag, color | curses.A_BOLD)
 
@@ -869,7 +875,7 @@ class MeshTUI:
             tag = " SAVING "
             self.safe_addstr(0, w - len(tag) - 2, tag, curses.color_pair(3) | curses.A_BOLD)
         elif self.channels_status and time.time() - self.channels_status_time < 3:
-            tag = f" {self.channels_status[:20]} "
+            tag = f" {self.channels_status[:32]} "
             color = curses.color_pair(4) if self.channels_status.startswith('Err') else curses.color_pair(1)
             self.safe_addstr(0, w - len(tag) - 2, tag, color | curses.A_BOLD)
 

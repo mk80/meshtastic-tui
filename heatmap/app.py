@@ -49,6 +49,10 @@ def local_only(f):
 nodes_data = {}
 nodes_lock = threading.Lock()
 interface = None
+# True iff the meshtastic library currently believes the serial link is up.
+# Flipped by pubsub events (meshtastic.connection.lost / .established).
+# interface.nodes stays populated across a reboot so it isn't a useful liveness signal.
+radio_connected = False
 
 # Message/event persistence: a SQLite store keyed by event time. The full event
 # JSON is stored in `payload` and replayed verbatim by /api/stream and /api/history,
@@ -334,27 +338,35 @@ def local_gps_poller():
         except Exception as e:
             logger.error(f"GPS poller error: {e}")
 
+def on_connection_lost(*args, **kwargs):
+    """Library tells us the serial link is dead — flip the flag the API checks."""
+    global radio_connected
+    radio_connected = False
+    logger.warning("meshtastic.connection.lost fired (radio likely rebooting)")
+
+def on_connection_established(*args, **kwargs):
+    global radio_connected
+    radio_connected = True
+    logger.info("meshtastic.connection.established fired")
+
 def connection_monitor():
+    """Drive reconnect when the library reports the link is gone, or when our
+    interface object disappears. Runs on a 2s tick so the UI sees updates fast.
+    """
     global interface
     while True:
-        time.sleep(2) # Faster detection for snappier UI recovery
-        is_alive = False
-        try:
-            if interface and interface.nodes:
-                is_alive = True
-        except:
-            is_alive = False
-
-        if not is_alive:
-            logger.warning("Radio connection lost. Attempting to reconnect...")
-            if interface:
-                try: interface.close()
-                except: pass
-                interface = None
-            connect_radio()
+        time.sleep(2)
+        if interface and radio_connected:
+            continue
+        logger.warning("Radio connection lost. Attempting to reconnect...")
+        if interface:
+            try: interface.close()
+            except: pass
+            interface = None
+        connect_radio()
 
 def connect_radio():
-    global interface
+    global interface, radio_connected
     logger.info("Connecting to Meshtastic...")
     try:
         port = os.environ.get('MESHTASTIC_PORT')
@@ -364,17 +376,19 @@ def connect_radio():
         else:
             interface = meshtastic.serial_interface.SerialInterface()
         init_node_data(interface)
-        pub.subscribe(on_receive, "meshtastic.receive")
-        
+        # Belt-and-suspenders: the .established pubsub handler will also flip
+        # this, but set it eagerly in case the event doesn't fire on first connect.
+        radio_connected = True
+
         # Start background threads if not already running
-        # We use a simple flag check to avoid duplicate threads on reconnect
         if not any(t.name == "gps_poller" for t in threading.enumerate()):
             threading.Thread(target=local_gps_poller, daemon=True, name="gps_poller").start()
         if not any(t.name == "conn_monitor" for t in threading.enumerate()):
             threading.Thread(target=connection_monitor, daemon=True, name="conn_monitor").start()
-            
+
         logger.info(f"Connected! Initialized with {len(nodes_data)} nodes.")
     except Exception as e:
+        radio_connected = False
         logger.error(f"Connection failed: {e}")
 
 
@@ -434,7 +448,7 @@ def api_history():
 @app.route('/api/state')
 @local_only
 def api_state():
-    if not interface:
+    if not interface or not radio_connected:
         return jsonify({'error': 'Not connected'}), 500
         
     local_id = get_local_node_id() or "Unknown"
@@ -940,6 +954,12 @@ def api_send():
 
 if __name__ == '__main__':
     init_db()
+    # Subscribe pubsub handlers once at startup (not per-connect) so that
+    # reconnects don't stack duplicate handlers (which would re-fire on_receive
+    # N times per packet).
+    pub.subscribe(on_receive, "meshtastic.receive")
+    pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
+    pub.subscribe(on_connection_established, "meshtastic.connection.established")
     connect_radio()
     logger.info("Daemon starting on 0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
