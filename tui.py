@@ -131,7 +131,7 @@ class MeshTUI:
         except curses.error:
             pass
 
-    def draw_sidebar(self, h, mid_x, split1, split2, split3):
+    def draw_sidebar(self, h, mid_x, split1, split2):
         # Radio Stats
         self.safe_addstr(0, 2, " Radio Stats ", curses.color_pair(1) | curses.A_BOLD)
         self.safe_addstr(2, 2, f"Device: {self.state.get('name', 'Unknown')}")
@@ -163,40 +163,13 @@ class MeshTUI:
         # Node Neighbors
         self.safe_addstr(split2, 2, " Node Neighbors ", curses.color_pair(3) | curses.A_BOLD)
         tel_y = split2 + 2
-        max_tel = split3 - split2 - 2
+        max_tel = h - split2 - 3
         for t in self.neighbor_events[-max_tel:]:
             sender = t.get('from', 'Unknown')
             pos = t.get('pos', {})
             line = f"{sender}: {pos.get('latitude', 0.0):.4f}, {pos.get('longitude', 0.0):.4f}"
             self.safe_addstr(tel_y, 2, line[:mid_x-4])
             tel_y += 1
-            
-        # Device Config (read-only summary; full editing is in Settings mode, key C)
-        status_line = ""
-        status_color = 0
-        if self.settings_saving:
-            status_line = "[ SAVING... ]"
-            status_color = curses.color_pair(3) | curses.A_BOLD
-        elif self.settings_status and time.time() - self.settings_status_time < 3:
-            status_line = f"[ {self.settings_status[:18]} ]"
-            status_color = curses.color_pair(2) | curses.A_BOLD
-
-        self.safe_addstr(split3, 2, " Device Config ", curses.color_pair(4) | curses.A_BOLD)
-        if status_line:
-            self.safe_addstr(split3, mid_x - len(status_line) - 2, status_line, status_color)
-
-        rows = [
-            ("Long Name",  self.state.get('long_name', '')),
-            ("Short Name", self.state.get('short_name', '')),
-            ("Hop Limit",  self.state.get('hop_limit', 3)),
-            ("",           "Press C for full Settings"),
-        ]
-        for i, (label, val) in enumerate(rows):
-            label_str = f"{label}: " if label else ""
-            self.safe_addstr(split3 + 1 + i, 2, label_str)
-            attr = curses.color_pair(3) if not label else 0
-            self.safe_addstr(split3 + 1 + i, 2 + len(label_str),
-                             str(val or "")[:mid_x - len(label_str) - 3], attr)
 
     def draw_messages(self, h, w, mid_x):
         ch_name = self.channels.get(self.active_channel) if isinstance(self.active_channel, int) else self.dm_nodes.get(self.active_channel, self.active_channel)
@@ -306,15 +279,14 @@ class MeshTUI:
             return
             
         mid_x = w // 2
-        split1, split2, split3 = h // 4, (h * 2) // 4, (h * 3) // 4
-        
+        split1, split2 = h // 3, (h * 2) // 3
+
         # Borders and Frames
         try:
             self.stdscr.box()
             self.stdscr.vline(1, mid_x, curses.ACS_VLINE, h - 2)
             self.stdscr.hline(split1, 1, curses.ACS_HLINE, mid_x - 1)
             self.stdscr.hline(split2, 1, curses.ACS_HLINE, mid_x - 1)
-            self.stdscr.hline(split3, 1, curses.ACS_HLINE, mid_x - 1)
         except: pass
         
         if self.offline_mode:
@@ -322,7 +294,7 @@ class MeshTUI:
         elif self.radio_offline:
             self.safe_addstr(0, w - 20, " [ RADIO OFFLINE ]  ", curses.color_pair(4) | curses.A_BLINK | curses.A_BOLD)
 
-        self.draw_sidebar(h, mid_x, split1, split2, split3)
+        self.draw_sidebar(h, mid_x, split1, split2)
         if self.settings_mode:
             self.draw_settings(h, w, mid_x)
         else:
