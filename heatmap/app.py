@@ -685,6 +685,147 @@ def api_config_post():
         logger.error(f"config write failed for section={section}: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ----- Channel CRUD + URL share/import -----
+
+CHANNEL_ROLE_NAMES = {0: 'DISABLED', 1: 'PRIMARY', 2: 'SECONDARY'}
+CHANNEL_ROLE_VALUES = {v: k for k, v in CHANNEL_ROLE_NAMES.items()}
+
+def _classify_psk(b):
+    """Best-effort summary of a PSK byte string for the UI."""
+    if not b:
+        return 'none'
+    if len(b) == 1:
+        if b[0] == 0:
+            return 'none'
+        if b[0] == 1:
+            return 'default'
+        return f'simple{b[0] - 1}'
+    return f'aes{len(b) * 8}'
+
+def _ensure_channels_loaded(node):
+    if not node.channels:
+        try:
+            node.requestChannels()
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"requestChannels failed: {e}")
+
+def _serialize_channel(ch):
+    s = ch.settings
+    psk = bytes(s.psk) if s.psk else b''
+    return {
+        'index':             ch.index,
+        'role':              CHANNEL_ROLE_NAMES.get(ch.role, str(ch.role)),
+        'name':              s.name or '',
+        'psk_hex':           psk.hex(),
+        'psk_kind':          _classify_psk(psk),
+        'uplink_enabled':    bool(s.uplink_enabled),
+        'downlink_enabled':  bool(s.downlink_enabled),
+    }
+
+@app.route('/api/channels', methods=['GET'])
+@local_only
+def api_channels_get():
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+    _ensure_channels_loaded(node)
+    return jsonify({'channels': [_serialize_channel(c) for c in (node.channels or [])]})
+
+@app.route('/api/channels', methods=['POST'])
+@local_only
+def api_channels_post():
+    """Modify a channel by index. Body: {index, role?, name?, psk?, uplink_enabled?, downlink_enabled?}.
+
+    psk accepts: 'none', 'default', 'random', 'simple<N>' (0-9), or a hex/0x-hex key.
+    """
+    import meshtastic.util
+    data = request.json or {}
+    idx = data.get('index')
+    if not isinstance(idx, int) or idx < 0:
+        return jsonify({'error': 'integer "index" required'}), 400
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+    _ensure_channels_loaded(node)
+
+    if not node.channels or idx >= len(node.channels):
+        return jsonify({'error': f'channel index {idx} out of range'}), 400
+    ch = node.channels[idx]
+
+    try:
+        if 'role' in data:
+            role = str(data['role']).upper()
+            if role not in CHANNEL_ROLE_VALUES:
+                return jsonify({'error': f'role must be one of {list(CHANNEL_ROLE_VALUES)}'}), 400
+            ch.role = CHANNEL_ROLE_VALUES[role]
+        if 'name' in data:
+            ch.settings.name = str(data['name'] or '')
+        if 'psk' in data:
+            psk_in = data['psk']
+            if isinstance(psk_in, str):
+                ch.settings.psk = meshtastic.util.fromPSK(psk_in)
+            elif isinstance(psk_in, list):
+                ch.settings.psk = bytes(psk_in)
+            else:
+                return jsonify({'error': 'psk must be a string or byte list'}), 400
+        if 'uplink_enabled' in data:
+            ch.settings.uplink_enabled = bool(data['uplink_enabled'])
+        if 'downlink_enabled' in data:
+            ch.settings.downlink_enabled = bool(data['downlink_enabled'])
+
+        node.writeChannel(idx)
+        return jsonify({'status': 'ok', 'channel': _serialize_channel(ch)})
+    except Exception as e:
+        logger.error(f"channel write failed for idx={idx}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/<int:idx>', methods=['DELETE'])
+@local_only
+def api_channels_delete(idx):
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    try:
+        interface.localNode.deleteChannel(idx)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"channel delete failed for idx={idx}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/url', methods=['GET'])
+@local_only
+def api_channels_url():
+    """Shareable meshtastic.org/e/# URL encoding the current channel set."""
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    try:
+        include_all = request.args.get('all', 'true').lower() != 'false'
+        return jsonify({'url': interface.localNode.getURL(includeAll=include_all)})
+    except Exception as e:
+        logger.error(f"getURL failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/import', methods=['POST'])
+@local_only
+def api_channels_import():
+    """Apply a meshtastic share URL. mode='replace' (default) overwrites; 'add' merges new channels."""
+    data = request.json or {}
+    url = (data.get('url') or '').strip()
+    mode = (data.get('mode') or 'replace').lower()
+    if not url:
+        return jsonify({'error': '"url" required'}), 400
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    try:
+        interface.localNode.setURL(url, addOnly=(mode == 'add'))
+        return jsonify({'status': 'ok'})
+    except SystemExit as e:
+        # The library uses our_exit() for invalid URLs — turn that into a 400.
+        return jsonify({'error': str(e) or 'Invalid URL'}), 400
+    except Exception as e:
+        logger.error(f"setURL failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 def set_pref(node, key, val):
     import meshtastic.util
 
