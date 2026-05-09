@@ -58,7 +58,6 @@ radio_connected = False
 # JSON is stored in `payload` and replayed verbatim by /api/stream and /api/history,
 # while the indexed columns let us answer per-channel and DM backfill queries fast.
 MESSAGES_DB = 'messages.db'
-MESSAGES_FILE = 'messages.json'  # legacy; migrated on first start with new code
 db_lock = threading.Lock()
 db_conn = None
 STREAM_LIMIT = 500
@@ -87,21 +86,6 @@ def init_db():
     db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_channel_time ON events(channel, time)")
     db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dm_time ON events(from_id, to_id, time)")
     db_conn.commit()
-
-    # One-time migration from the legacy messages.json.
-    if os.path.exists(MESSAGES_FILE):
-        try:
-            existing = db_conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            with open(MESSAGES_FILE) as f:
-                old = json.load(f)
-            if existing == 0 and old:
-                logger.info(f"Migrating {len(old)} events from {MESSAGES_FILE} into {MESSAGES_DB}")
-                for e in old:
-                    _insert_event_row(e)
-            os.rename(MESSAGES_FILE, MESSAGES_FILE + '.bak')
-            logger.info(f"Renamed {MESSAGES_FILE} to {MESSAGES_FILE}.bak")
-        except Exception as ex:
-            logger.warning(f"Legacy messages.json migration skipped: {ex}")
 
 def _insert_event_row(event):
     db_conn.execute(

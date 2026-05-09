@@ -56,9 +56,6 @@ cover/
 
 # OS
 .DS_Store
-heatmap/messages.json
-heatmap/messages.json.tmp
-heatmap/messages.json.bak
 heatmap/messages.db
 heatmap/messages.db-wal
 heatmap/messages.db-shm
