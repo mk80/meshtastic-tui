@@ -1,7 +1,7 @@
 import logging
 import time
 import threading
-from collections import deque
+import sqlite3
 from flask import Flask, jsonify, send_from_directory, request, abort
 from functools import wraps
 import meshtastic
@@ -48,34 +48,61 @@ def local_only(f):
 
 nodes_data = {}
 nodes_lock = threading.Lock()
-events = deque(maxlen=10) # User requested 10 recent messages limit
-events_lock = threading.Lock()
-MESSAGES_FILE = 'messages.json'
 interface = None
+# True iff the meshtastic library currently believes the serial link is up.
+# Flipped by pubsub events (meshtastic.connection.lost / .established).
+# interface.nodes stays populated across a reboot so it isn't a useful liveness signal.
+radio_connected = False
 
-def save_events():
-    try:
-        tmp_file = MESSAGES_FILE + ".tmp"
-        with events_lock:
-            data = [e for e in events if e.get('type') == 'text']
-        with open(tmp_file, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp_file, MESSAGES_FILE)
-    except Exception as e:
-        logger.error(f"Error saving messages: {e}")
+# Message/event persistence: a SQLite store keyed by event time. The full event
+# JSON is stored in `payload` and replayed verbatim by /api/stream and /api/history,
+# while the indexed columns let us answer per-channel and DM backfill queries fast.
+MESSAGES_DB = 'messages.db'
+db_lock = threading.Lock()
+db_conn = None
+STREAM_LIMIT = 500
+HISTORY_LIMIT = 500
 
-def load_events():
-    if not os.path.exists(MESSAGES_FILE):
-        return
-    try:
-        with open(MESSAGES_FILE, 'r') as f:
-            saved = json.load(f)
-            with events_lock:
-                events.clear()
-                events.extend(saved)
-            logger.info(f"Loaded {len(events)} (out of {len(saved)} on disk) messages into recent history.")
-    except Exception as e:
-        logger.error(f"Error loading messages: {e}")
+def init_db():
+    global db_conn
+    db_conn = sqlite3.connect(MESSAGES_DB, check_same_thread=False)
+    db_conn.row_factory = sqlite3.Row
+    db_conn.execute("PRAGMA journal_mode=WAL")
+    db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            time      REAL    NOT NULL,
+            type      TEXT    NOT NULL,
+            from_id   TEXT,
+            to_id     TEXT,
+            from_name TEXT,
+            channel   INTEGER,
+            text      TEXT,
+            hop_limit INTEGER,
+            payload   TEXT    NOT NULL
+        )
+    """)
+    db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(time)")
+    db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_channel_time ON events(channel, time)")
+    db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_dm_time ON events(from_id, to_id, time)")
+    db_conn.commit()
+
+def _insert_event_row(event):
+    db_conn.execute(
+        "INSERT INTO events (time, type, from_id, to_id, from_name, channel, text, hop_limit, payload) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            event.get('time', time.time()),
+            event.get('type', 'unknown'),
+            event.get('fromId'),
+            event.get('toId'),
+            event.get('from'),
+            event.get('channel'),
+            event.get('text'),
+            event.get('hopLimit'),
+            json.dumps(event),
+        ),
+    )
 
 def get_local_node_id():
     """Robustly fetch the local node's ID from the interface."""
@@ -137,14 +164,16 @@ def normalize_pos(pos):
 
 def add_event(msg_or_dict):
     if isinstance(msg_or_dict, dict):
-        clean_dict = proto_to_dict(msg_or_dict)
-        clean_dict['time'] = time.time()
-        with events_lock:
-            events.append(clean_dict)
+        event = proto_to_dict(msg_or_dict)
+        event['time'] = time.time()
     else:
-        with events_lock:
-            events.append({'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'})
-    save_events()
+        event = {'time': time.time(), 'message': str(msg_or_dict), 'type': 'unknown'}
+    try:
+        with db_lock:
+            _insert_event_row(event)
+            db_conn.commit()
+    except Exception as e:
+        logger.error(f"Failed to persist event: {e}")
 
 def init_node_data(interface):
     local_id = get_local_node_id()
@@ -293,27 +322,40 @@ def local_gps_poller():
         except Exception as e:
             logger.error(f"GPS poller error: {e}")
 
+def on_connection_lost(interface=None):
+    """Library tells us the serial link is dead — flip the flag the API checks.
+
+    pubsub binds the topic data spec to the subscriber's signature, so the kwargs
+    here must match what mesh_interface.py sends:
+    pub.sendMessage("meshtastic.connection.lost", interface=self)
+    """
+    global radio_connected
+    radio_connected = False
+    logger.warning("meshtastic.connection.lost fired (radio likely rebooting)")
+
+def on_connection_established(interface=None):
+    global radio_connected
+    radio_connected = True
+    logger.info("meshtastic.connection.established fired")
+
 def connection_monitor():
+    """Drive reconnect when the library reports the link is gone, or when our
+    interface object disappears. Runs on a 2s tick so the UI sees updates fast.
+    """
     global interface
     while True:
-        time.sleep(2) # Faster detection for snappier UI recovery
-        is_alive = False
-        try:
-            if interface and interface.nodes:
-                is_alive = True
-        except:
-            is_alive = False
-
-        if not is_alive:
-            logger.warning("Radio connection lost. Attempting to reconnect...")
-            if interface:
-                try: interface.close()
-                except: pass
-                interface = None
-            connect_radio()
+        time.sleep(2)
+        if interface and radio_connected:
+            continue
+        logger.warning("Radio connection lost. Attempting to reconnect...")
+        if interface:
+            try: interface.close()
+            except: pass
+            interface = None
+        connect_radio()
 
 def connect_radio():
-    global interface
+    global interface, radio_connected
     logger.info("Connecting to Meshtastic...")
     try:
         port = os.environ.get('MESHTASTIC_PORT')
@@ -323,17 +365,19 @@ def connect_radio():
         else:
             interface = meshtastic.serial_interface.SerialInterface()
         init_node_data(interface)
-        pub.subscribe(on_receive, "meshtastic.receive")
-        
+        # Belt-and-suspenders: the .established pubsub handler will also flip
+        # this, but set it eagerly in case the event doesn't fire on first connect.
+        radio_connected = True
+
         # Start background threads if not already running
-        # We use a simple flag check to avoid duplicate threads on reconnect
         if not any(t.name == "gps_poller" for t in threading.enumerate()):
             threading.Thread(target=local_gps_poller, daemon=True, name="gps_poller").start()
         if not any(t.name == "conn_monitor" for t in threading.enumerate()):
             threading.Thread(target=connection_monitor, daemon=True, name="conn_monitor").start()
-            
+
         logger.info(f"Connected! Initialized with {len(nodes_data)} nodes.")
     except Exception as e:
+        radio_connected = False
         logger.error(f"Connection failed: {e}")
 
 
@@ -351,14 +395,49 @@ def api_heatmap():
 @local_only
 def api_stream():
     since = request.args.get('since', 0, type=float)
-    with events_lock:
-        new_events = [e for e in events if e.get('time', 0.0) > since]
-    return jsonify(new_events)
+    with db_lock:
+        rows = db_conn.execute(
+            "SELECT payload FROM events WHERE time > ? ORDER BY time LIMIT ?",
+            (since, STREAM_LIMIT),
+        ).fetchall()
+    return jsonify([json.loads(r['payload']) for r in rows])
+
+@app.route('/api/history')
+@local_only
+def api_history():
+    """Backfill text history for a channel or DM thread, oldest-first."""
+    channel = request.args.get('channel', type=int)
+    dm = request.args.get('dm')
+    before = request.args.get('before', type=float, default=time.time())
+    limit = min(request.args.get('limit', 100, type=int), HISTORY_LIMIT)
+
+    with db_lock:
+        if channel is not None:
+            rows = db_conn.execute(
+                "SELECT payload FROM events "
+                "WHERE type='text' AND channel=? AND time<? "
+                "  AND (to_id IS NULL OR to_id IN ('^all','^local','!ffffffff')) "
+                "ORDER BY time DESC LIMIT ?",
+                (channel, before, limit),
+            ).fetchall()
+        elif dm:
+            local_id = get_local_node_id() or ''
+            rows = db_conn.execute(
+                "SELECT payload FROM events "
+                "WHERE type='text' AND time<? "
+                "  AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?)) "
+                "ORDER BY time DESC LIMIT ?",
+                (before, dm, local_id, local_id, dm, limit),
+            ).fetchall()
+        else:
+            return jsonify({'error': 'channel or dm parameter required'}), 400
+
+    return jsonify([json.loads(r['payload']) for r in reversed(rows)])
 
 @app.route('/api/state')
 @local_only
 def api_state():
-    if not interface:
+    if not interface or not radio_connected:
         return jsonify({'error': 'Not connected'}), 500
         
     local_id = get_local_node_id() or "Unknown"
@@ -387,6 +466,20 @@ def api_state():
     except:
         pass
 
+    # Surface channel names so the TUI's tab cycle shows real names, not "Ch N".
+    # Use whatever's already cached — don't request from the radio here, the
+    # state endpoint is polled often.
+    channels = []
+    try:
+        for ch in (interface.localNode.channels or []):
+            channels.append({
+                'index': ch.index,
+                'name':  ch.settings.name or '',
+                'role':  CHANNEL_ROLE_NAMES.get(ch.role, str(ch.role)),
+            })
+    except Exception:
+        pass
+
     state = {
         'nodes_online': len(nodes_data),
         'local_id': local_id,
@@ -403,6 +496,7 @@ def api_state():
         'long_name': user_info.get('longName', name),
         'short_name': user_info.get('shortName', "Unknown"),
         'hop_limit': getattr(lora_config, 'hop_limit', 3), # Expose hop limit
+        'channels': channels,
         'server_time': time.time()
     }
     return jsonify(state)
@@ -464,9 +558,295 @@ def api_config_apply():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+LOCAL_CONFIG_SECTIONS = ('device', 'position', 'power', 'network', 'display',
+                        'lora', 'bluetooth', 'security')
+MODULE_CONFIG_SECTIONS = ('mqtt', 'serial', 'external_notification', 'store_forward',
+                         'range_test', 'telemetry', 'canned_message', 'audio',
+                         'remote_hardware', 'neighbor_info', 'ambient_lighting',
+                         'detection_sensor', 'paxcounter')
+
+# Wire-type integer → friendly name. Mirrors google.protobuf.descriptor.FieldDescriptor.TYPE_*.
+PROTO_TYPE_NAMES = {
+    1: 'double', 2: 'float', 3: 'int64', 4: 'uint64',
+    5: 'int32', 6: 'fixed64', 7: 'fixed32', 8: 'bool',
+    9: 'string', 10: 'group', 11: 'message', 12: 'bytes',
+    13: 'uint32', 14: 'enum', 15: 'sfixed32', 16: 'sfixed64',
+    17: 'sint32', 18: 'sint64',
+}
+
+def _config_section_map(node):
+    """Section name → protobuf section message, covering localConfig + moduleConfig."""
+    sections = {}
+    for name in LOCAL_CONFIG_SECTIONS:
+        if hasattr(node.localConfig, name):
+            sections[name] = getattr(node.localConfig, name)
+    for name in MODULE_CONFIG_SECTIONS:
+        if hasattr(node.moduleConfig, name):
+            sections[name] = getattr(node.moduleConfig, name)
+    return sections
+
+def _ensure_section_loaded(node, section_msg, section_name):
+    """If the local cache for this section is empty, ask the radio for it."""
+    try:
+        if len(section_msg.ListFields()) > 0:
+            return
+        field_desc = node.localConfig.DESCRIPTOR.fields_by_name.get(section_name) \
+                  or node.moduleConfig.DESCRIPTOR.fields_by_name.get(section_name)
+        if field_desc:
+            logger.info(f"Section {section_name} cache empty; requesting from radio")
+            node.requestConfig(field_desc)
+            time.sleep(0.5)
+    except Exception as e:
+        logger.warning(f"requestConfig({section_name}) failed: {e}")
+
+def describe_section(section_msg):
+    """Walk a section message's descriptor and emit typed field info + current values."""
+    out = []
+    for fd in section_msg.DESCRIPTOR.fields:
+        type_name = PROTO_TYPE_NAMES.get(fd.type, 'unknown')
+        try:
+            value = getattr(section_msg, fd.name)
+        except AttributeError:
+            value = None
+
+        info = {'name': fd.name, 'type': type_name}
+        is_repeated = getattr(fd, 'is_repeated', False) or getattr(fd, 'label', None) == 3
+        if is_repeated:
+            info['type'] = 'repeated_' + type_name
+            info['value'] = list(value) if value else []
+        elif fd.type == fd.TYPE_ENUM:
+            info['enum_values'] = [v.name for v in fd.enum_type.values]
+            try:
+                info['value'] = fd.enum_type.values_by_number[value].name
+            except (KeyError, TypeError):
+                info['value'] = value
+        elif fd.type == fd.TYPE_BYTES:
+            info['value'] = value.hex() if value else ''
+        elif fd.type == fd.TYPE_MESSAGE:
+            # Nested messages (e.g. position.fixed_position struct) are not editable
+            # generically; surface as opaque so the TUI can show them read-only.
+            info['type'] = 'message'
+            info['skipped'] = True
+            info['value'] = None
+        else:
+            info['value'] = value
+        out.append(info)
+    return out
+
+@app.route('/api/config', methods=['GET'])
+@local_only
+def api_config_get():
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+    out = {'localConfig': {}, 'moduleConfig': {}, 'user': []}
+    sections = _config_section_map(node)
+    for name, msg in sections.items():
+        _ensure_section_loaded(node, msg, name)
+        bucket = 'localConfig' if name in LOCAL_CONFIG_SECTIONS else 'moduleConfig'
+        out[bucket][name] = describe_section(msg)
+    try:
+        user = (interface.getMyNodeInfo() or {}).get('user', {})
+        out['user'] = [
+            {'name': 'long_name',       'type': 'string', 'value': user.get('longName', '')},
+            {'name': 'short_name',      'type': 'string', 'value': user.get('shortName', '')},
+            {'name': 'is_licensed',     'type': 'bool',   'value': bool(user.get('isLicensed', False))},
+            {'name': 'is_unmessagable', 'type': 'bool',   'value': bool(user.get('isUnmessagable', False))},
+        ]
+    except Exception:
+        pass
+    return jsonify(out)
+
+@app.route('/api/config', methods=['POST'])
+@local_only
+def api_config_post():
+    """Apply a batch of field changes to one config section, atomically when supported."""
+    data = request.json or {}
+    section = data.get('section')
+    fields = data.get('fields') or {}
+    if not section or not isinstance(fields, dict):
+        return jsonify({'error': 'body must be {"section": "...", "fields": {...}}'}), 400
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+
+    try:
+        if section == 'user':
+            kwargs = {k: fields[k] for k in ('long_name', 'short_name', 'is_licensed', 'is_unmessagable')
+                      if k in fields}
+            if not kwargs:
+                return jsonify({'error': 'no recognized user fields'}), 400
+            node.setOwner(**kwargs)
+            return jsonify({'status': 'ok'})
+
+        if section not in _config_section_map(node):
+            return jsonify({'error': f'unknown section: {section}'}), 400
+
+        in_tx = False
+        try:
+            node.beginSettingsTransaction()
+            in_tx = True
+        except Exception as e:
+            logger.warning(f"beginSettingsTransaction unavailable: {e}")
+
+        try:
+            for fname, val in fields.items():
+                set_pref(node, f"{section}.{fname}", val)
+        finally:
+            if in_tx:
+                try:
+                    node.commitSettingsTransaction()
+                except Exception as e:
+                    logger.warning(f"commitSettingsTransaction failed: {e}")
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"config write failed for section={section}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ----- Channel CRUD + URL share/import -----
+
+CHANNEL_ROLE_NAMES = {0: 'DISABLED', 1: 'PRIMARY', 2: 'SECONDARY'}
+CHANNEL_ROLE_VALUES = {v: k for k, v in CHANNEL_ROLE_NAMES.items()}
+
+def _classify_psk(b):
+    """Best-effort summary of a PSK byte string for the UI."""
+    if not b:
+        return 'none'
+    if len(b) == 1:
+        if b[0] == 0:
+            return 'none'
+        if b[0] == 1:
+            return 'default'
+        return f'simple{b[0] - 1}'
+    return f'aes{len(b) * 8}'
+
+def _ensure_channels_loaded(node):
+    if not node.channels:
+        try:
+            node.requestChannels()
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"requestChannels failed: {e}")
+
+def _serialize_channel(ch):
+    s = ch.settings
+    psk = bytes(s.psk) if s.psk else b''
+    return {
+        'index':             ch.index,
+        'role':              CHANNEL_ROLE_NAMES.get(ch.role, str(ch.role)),
+        'name':              s.name or '',
+        'psk_hex':           psk.hex(),
+        'psk_kind':          _classify_psk(psk),
+        'uplink_enabled':    bool(s.uplink_enabled),
+        'downlink_enabled':  bool(s.downlink_enabled),
+    }
+
+@app.route('/api/channels', methods=['GET'])
+@local_only
+def api_channels_get():
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+    _ensure_channels_loaded(node)
+    return jsonify({'channels': [_serialize_channel(c) for c in (node.channels or [])]})
+
+@app.route('/api/channels', methods=['POST'])
+@local_only
+def api_channels_post():
+    """Modify a channel by index. Body: {index, role?, name?, psk?, uplink_enabled?, downlink_enabled?}.
+
+    psk accepts: 'none', 'default', 'random', 'simple<N>' (0-9), or a hex/0x-hex key.
+    """
+    import meshtastic.util
+    data = request.json or {}
+    idx = data.get('index')
+    if not isinstance(idx, int) or idx < 0:
+        return jsonify({'error': 'integer "index" required'}), 400
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    node = interface.localNode
+    _ensure_channels_loaded(node)
+
+    if not node.channels or idx >= len(node.channels):
+        return jsonify({'error': f'channel index {idx} out of range'}), 400
+    ch = node.channels[idx]
+
+    try:
+        if 'role' in data:
+            role = str(data['role']).upper()
+            if role not in CHANNEL_ROLE_VALUES:
+                return jsonify({'error': f'role must be one of {list(CHANNEL_ROLE_VALUES)}'}), 400
+            ch.role = CHANNEL_ROLE_VALUES[role]
+        if 'name' in data:
+            ch.settings.name = str(data['name'] or '')
+        if 'psk' in data:
+            psk_in = data['psk']
+            if isinstance(psk_in, str):
+                ch.settings.psk = meshtastic.util.fromPSK(psk_in)
+            elif isinstance(psk_in, list):
+                ch.settings.psk = bytes(psk_in)
+            else:
+                return jsonify({'error': 'psk must be a string or byte list'}), 400
+        if 'uplink_enabled' in data:
+            ch.settings.uplink_enabled = bool(data['uplink_enabled'])
+        if 'downlink_enabled' in data:
+            ch.settings.downlink_enabled = bool(data['downlink_enabled'])
+
+        node.writeChannel(idx)
+        return jsonify({'status': 'ok', 'channel': _serialize_channel(ch)})
+    except Exception as e:
+        logger.error(f"channel write failed for idx={idx}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/<int:idx>', methods=['DELETE'])
+@local_only
+def api_channels_delete(idx):
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    try:
+        interface.localNode.deleteChannel(idx)
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"channel delete failed for idx={idx}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/url', methods=['GET'])
+@local_only
+def api_channels_url():
+    """Shareable meshtastic.org/e/# URL encoding the current channel set."""
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    try:
+        include_all = request.args.get('all', 'true').lower() != 'false'
+        return jsonify({'url': interface.localNode.getURL(includeAll=include_all)})
+    except Exception as e:
+        logger.error(f"getURL failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/channels/import', methods=['POST'])
+@local_only
+def api_channels_import():
+    """Apply a meshtastic share URL. mode='replace' (default) overwrites; 'add' merges new channels."""
+    data = request.json or {}
+    url = (data.get('url') or '').strip()
+    mode = (data.get('mode') or 'replace').lower()
+    if not url:
+        return jsonify({'error': '"url" required'}), 400
+    if not interface or not interface.localNode:
+        return jsonify({'error': 'Radio not connected'}), 500
+    try:
+        interface.localNode.setURL(url, addOnly=(mode == 'add'))
+        return jsonify({'status': 'ok'})
+    except SystemExit as e:
+        # The library uses our_exit() for invalid URLs — turn that into a 400.
+        return jsonify({'error': str(e) or 'Invalid URL'}), 400
+    except Exception as e:
+        logger.error(f"setURL failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 def set_pref(node, key, val):
     import meshtastic.util
-    
+
     # Preferred way: use library helper if available
     try:
         if hasattr(node, 'set_simple_preference'):
@@ -477,27 +857,7 @@ def set_pref(node, key, val):
         logger.warning(f"set_simple_preference failed for {key}: {e}")
 
     # Fallback: Manual protobuf manipulation
-    section_map = {
-        'device': node.localConfig.device,
-        'lora': node.localConfig.lora,
-        'network': node.localConfig.network,
-        'display': node.localConfig.display,
-        'position': node.localConfig.position,
-        'power': node.localConfig.power,
-        'security': node.localConfig.security,
-        'telemetry': node.moduleConfig.telemetry,
-        'mqtt': node.moduleConfig.mqtt,
-        'serial': node.moduleConfig.serial,
-        'external_notification': node.moduleConfig.external_notification,
-        'store_forward': node.moduleConfig.store_forward,
-        'range_test': node.moduleConfig.range_test,
-        'canned_message': node.moduleConfig.canned_message,
-        'audio': node.moduleConfig.audio,
-        'remote_hardware': node.moduleConfig.remote_hardware,
-        'neighbor_info': node.moduleConfig.neighbor_info,
-        'ambient_lighting': node.moduleConfig.ambient_lighting,
-        'paxcounter': node.moduleConfig.paxcounter,
-    }
+    section_map = _config_section_map(node)
 
     if '.' not in key:
         raise ValueError("Key must be 'section.parameter'")
@@ -507,21 +867,7 @@ def set_pref(node, key, val):
         raise ValueError(f"Unknown section: {section_name}")
     
     section = section_map[section_name]
-    
-    # CLI sync logic: Request config if we don't have its fields yet
-    try:
-        if len(section.ListFields()) == 0:
-            logger.info(f"Section {section_name} is empty, requesting from radio...")
-            field_desc = node.localConfig.DESCRIPTOR.fields_by_name.get(section_name)
-            if not field_desc:
-                field_desc = node.moduleConfig.DESCRIPTOR.fields_by_name.get(section_name)
-            
-            if field_desc:
-                node.requestConfig(field_desc)
-                # Short wait for response
-                time.sleep(0.5)
-    except Exception as e:
-        logger.warning(f"Failed to requestConfig for {section_name}: {e}")
+    _ensure_section_loaded(node, section, section_name)
 
     field_name_snake = meshtastic.util.camel_to_snake(field_name)
     
@@ -596,7 +942,13 @@ def api_send():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    load_events()
+    init_db()
+    # Subscribe pubsub handlers once at startup (not per-connect) so that
+    # reconnects don't stack duplicate handlers (which would re-fire on_receive
+    # N times per packet).
+    pub.subscribe(on_receive, "meshtastic.receive")
+    pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
+    pub.subscribe(on_connection_established, "meshtastic.connection.established")
     connect_radio()
     logger.info("Daemon starting on 0.0.0.0:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)
