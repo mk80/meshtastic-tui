@@ -338,13 +338,18 @@ def local_gps_poller():
         except Exception as e:
             logger.error(f"GPS poller error: {e}")
 
-def on_connection_lost(*args, **kwargs):
-    """Library tells us the serial link is dead — flip the flag the API checks."""
+def on_connection_lost(interface=None):
+    """Library tells us the serial link is dead — flip the flag the API checks.
+
+    pubsub binds the topic data spec to the subscriber's signature, so the kwargs
+    here must match what mesh_interface.py sends:
+    pub.sendMessage("meshtastic.connection.lost", interface=self)
+    """
     global radio_connected
     radio_connected = False
     logger.warning("meshtastic.connection.lost fired (radio likely rebooting)")
 
-def on_connection_established(*args, **kwargs):
+def on_connection_established(interface=None):
     global radio_connected
     radio_connected = True
     logger.info("meshtastic.connection.established fired")

@@ -321,11 +321,11 @@ class MeshTUI:
             return
             
         mid_x = w // 2
-        # Fixed-size sidebar panes: Radio Stats and GPS each render ~8 rows of
-        # static content. Lock those to 8 each and let Node Neighbors absorb
-        # the remaining vertical space.
-        split1 = 8
-        split2 = 16
+        # Fixed-size sidebar panes: Radio Stats and GPS each have ~8 rows of
+        # static content; add 1 row of breathing room before each divider.
+        # Node Neighbors absorbs the remaining vertical space.
+        split1 = 9
+        split2 = 18
 
         # Borders and Frames
         try:
