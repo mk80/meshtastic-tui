@@ -69,6 +69,7 @@ class MeshTUI:
         self.offline_mode = False
         self.radio_offline = False
         self.running = True
+        self.has_synced = False
 
     def fetch_data(self):
         while self.running:
@@ -87,6 +88,7 @@ class MeshTUI:
                         self.last_event_time = 0.0
                         self.messages = []
                         self.neighbor_events = []
+                        self.has_synced = False
                     self.last_server_time = server_time
                     self.state = new_state
                     # Update tab labels from radio's actual channel names.
@@ -110,54 +112,63 @@ class MeshTUI:
                 else:
                     self.offline_mode = True
                     
-                # Fetch stream
-                r_stream = requests.get(f"{API_URL}/api/stream?since={self.last_event_time}", timeout=2)
-                if r_stream.status_code == 200:
-                    events = r_stream.json()
-                    for e in events:
-                        self.last_event_time = max(self.last_event_time, e.get('time', 0.0))
-                        if e.get('type') == 'text':
-                            ch = e.get('channel', 0)
-                            from_id = e.get('fromId')
-                            to_id = e.get('toId')
-                            local_id = self.state.get('local_id')
-                            
-                            is_dm = to_id not in BROADCAST_ADDRS
-                            partner_id = from_id if from_id != local_id else to_id
-                            tab_id = partner_id if is_dm else ch
-                            
-                            if tab_id != self.active_channel and from_id != local_id:
-                                self.unread_tabs.add(tab_id)
-                            
-                            if is_dm:
-                                target = from_id if from_id != local_id else to_id
-                                if target and target not in self.dm_nodes:
-                                    self.dm_nodes[target] = e.get('from', target) if from_id != local_id else target
-                            
-                            # Handle local messages: label history as 'You', skip live echoes
-                            if from_id == local_id:
-                                if self.last_event_time == 0.0: # This is a history fetch
-                                    e['from'] = 'You'
-                                else:
-                                    continue # Skip brand new local echoes from the radio
-                            
-                            # Deduplicate by time if needed, but for now just append
-                            self.messages.append(e)
-                        elif e.get('type') == 'position':
-                            self.neighbor_events.append(e)
-                    
-                    # Fetch nodes
-                    r_nodes = requests.get(f"{API_URL}/api/nodes", timeout=2)
-                    if r_nodes.status_code == 200:
-                        self.node_list = r_nodes.json()
-                else:
-                    self.offline_mode = True
+                # Fetch stream: Loop to catch up quickly if there are many events
+                while True:
+                    r_stream = requests.get(f"{API_URL}/api/stream?since={self.last_event_time}", timeout=2)
+                    if r_stream.status_code == 200:
+                        events = r_stream.json()
+                        for e in events:
+                            self.last_event_time = max(self.last_event_time, e.get('time', 0.0))
+                            if e.get('type') == 'text':
+                                ch = e.get('channel', 0)
+                                from_id = e.get('fromId')
+                                to_id = e.get('toId')
+                                local_id = self.state.get('local_id')
+                                
+                                is_dm = to_id not in BROADCAST_ADDRS
+                                partner_id = from_id if from_id != local_id else to_id
+                                tab_id = partner_id if is_dm else ch
+                                
+                                if tab_id != self.active_channel and from_id != local_id:
+                                    self.unread_tabs.add(tab_id)
+                                
+                                if is_dm:
+                                    target = from_id if from_id != local_id else to_id
+                                    if target and target not in self.dm_nodes:
+                                        self.dm_nodes[target] = e.get('from', target) if from_id != local_id else target
+                                
+                                # Handle local messages: label history as 'You', skip live echoes
+                                if from_id == local_id:
+                                    if not self.has_synced: # This is a history fetch
+                                        e['from'] = 'You'
+                                    else:
+                                        continue # Skip brand new local echoes from the radio
+                                
+                                # Deduplicate by time if needed, but for now just append
+                                self.messages.append(e)
+                            elif e.get('type') == 'position':
+                                if e.get('fromId') != self.state.get('local_id'):
+                                    self.neighbor_events.append(e)
+                        
+                        if not events or len(events) < 500:
+                            self.has_synced = True
+                            break
+                    else:
+                        self.offline_mode = True
+                        break
+
+                # Fetch nodes
+                r_nodes = requests.get(f"{API_URL}/api/nodes", timeout=2)
+                if r_nodes.status_code == 200:
+                    self.node_list = r_nodes.json()
             except Exception:
                 self.offline_mode = True
             time.sleep(1)
 
     def safe_addstr(self, y, x, text, attr=0):
         try:
+            if isinstance(text, str):
+                text = text.replace('\0', '')
             self.stdscr.addstr(y, x, text, attr)
         except curses.error:
             pass
@@ -195,7 +206,9 @@ class MeshTUI:
         self.safe_addstr(split2, 2, " Node Neighbors ", curses.color_pair(3) | curses.A_BOLD)
         tel_y = split2 + 2
         max_tel = h - split2 - 3
-        for t in self.neighbor_events[-max_tel:]:
+        local_id = self.state.get('local_id', 'Unknown')
+        filtered_events = [t for t in self.neighbor_events if t.get('fromId') != local_id]
+        for t in filtered_events[-max_tel:]:
             sender = t.get('from', 'Unknown')
             pos = t.get('pos', {})
             line = f"{sender}: {pos.get('latitude', 0.0):.4f}, {pos.get('longitude', 0.0):.4f}"
